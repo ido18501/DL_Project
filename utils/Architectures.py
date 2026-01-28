@@ -200,21 +200,33 @@ class ATP_R_Transf(nn.Module):
         # third change: adding support for attention pooling
         x_tokens = x[:, 1:, :]
         x_cls = x[:, 0, :]
+        # Ido and Yaniv- try to mask
+        token_mask = (sorted_TDS_normalized.abs().sum(dim=-1) > 0)
+
+        # masked mean
+        mask_f = token_mask.unsqueeze(-1).float()
+        denom = mask_f.sum(dim=1).clamp(min=1e-6)
+        x_mean = (x_tokens * mask_f).sum(dim=1) / denom
+
+        # masked max
+        x_masked = x_tokens.masked_fill(~token_mask.unsqueeze(-1), float('-inf'))
+        x_max = x_masked.max(dim=1).values  # [B, d]
         x = None
         if self.pool == 'cls':
             x = x_cls
         elif self.pool == 'mean':
-            x = x_tokens.mean(dim=1)
+            x = x_mean
         elif self.pool == 'mean_max':
-            x = torch.cat([x_tokens.mean(dim=1), x_tokens.max(dim=1).values], dim=-1)
+            x = torch.cat([x_mean, x_max], dim=-1)
         elif self.pool == 'mean_cls':
-            x = torch.cat([x_tokens.mean(dim=1), x_cls], dim=-1)
+            x = torch.cat([x_mean, x_cls], dim=-1)
         elif self.pool == 'mean_max_cls':
-            x = torch.cat([x_tokens.mean(dim=1), x_tokens.max(dim=1).values, x_cls], dim=-1)
+            x = torch.cat([x_mean, x_max, x_cls], dim=-1)
         elif self.pool == 'attn':
             scores = self.attn_pool(x_tokens).squeeze(-1)
-            w = torch.softmax(scores, dim=1)
-            x = (x_tokens * w.unsqueeze(-1)).sum(dim=1)
+            scores = scores.masked_fill(~token_mask, float('-inf'))
+            weights = torch.softmax(scores, dim=1)
+            x = (x_tokens * weights.unsqueeze(-1)).sum(dim=1)
         else:
             raise ValueError("Pooling type is not supported")
 
@@ -371,6 +383,39 @@ class LOS_Net(nn.Module):
             w = torch.softmax(scores, dim=1)
             x = (x_tokens * w.unsqueeze(-1)).sum(dim=1)
 
+        else:
+            raise ValueError("Pooling type is not supported")# Ido and Yaniv: another change here - we don't want to average over cls, and we want to support mean-max
+        # second change: allowing mean/mean_max to combine cls
+        # third change: adding support for attention pooling
+        x_tokens = x[:, 1:, :]
+        x_cls = x[:, 0, :]
+        # Ido and Yaniv- try to mask
+        token_mask = (sorted_TDS_normalized.abs().sum(dim=-1) > 0)
+
+        # masked mean
+        mask_f = token_mask.unsqueeze(-1).float()
+        denom = mask_f.sum(dim=1).clamp(min=1e-6)
+        x_mean = (x_tokens * mask_f).sum(dim=1) / denom
+
+        # masked max
+        x_masked = x_tokens.masked_fill(~token_mask.unsqueeze(-1), float('-inf'))
+        x_max = x_masked.max(dim=1).values  # [B, d]
+        x = None
+        if self.pool == 'cls':
+            x = x_cls
+        elif self.pool == 'mean':
+            x = x_mean
+        elif self.pool == 'mean_max':
+            x = torch.cat([x_mean, x_max], dim=-1)
+        elif self.pool == 'mean_cls':
+            x = torch.cat([x_mean, x_cls], dim=-1)
+        elif self.pool == 'mean_max_cls':
+            x = torch.cat([x_mean, x_max, x_cls], dim=-1)
+        elif self.pool == 'attn':
+            scores = self.attn_pool(x_tokens).squeeze(-1)
+            scores = scores.masked_fill(~token_mask, float('-inf'))
+            weights = torch.softmax(scores, dim=1)
+            x = (x_tokens * weights.unsqueeze(-1)).sum(dim=1)
         else:
             raise ValueError("Pooling type is not supported")
 
