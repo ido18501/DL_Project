@@ -105,7 +105,8 @@ class ATP_R_Transf(nn.Module):
         self.dropout = args.dropout
         self.num_layers = args.num_layers
         self.pool = args.pool
-        assert self.pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
+        assert self.pool in {'cls', 'mean', 'mean_max'}, ('pool type must be either cls (cls token),mean (mean pooling)'
+                                                          ' or mean_max (mean-max polling)')
 
         self.param_for_normalized_ATP = nn.Parameter(torch.randn(1, 1, self.hidden_dim))
         if self.args.rank_encoding == 'scale_encoding':
@@ -138,7 +139,13 @@ class ATP_R_Transf(nn.Module):
         ])
 
         # Classification head
-        self.mlp_head = nn.Linear(self.hidden_dim, 1)
+
+        # Ido and Yaniv:
+        # first change done here - head's input dim modification in order to support mean-max polling
+        head_in = self.hidden_dim
+        if self.pool == 'mean_max':
+            head_in *= 2
+        self.mlp_head = nn.Linear(head_in, 1)
         self.sigmoid = nn.Sigmoid()
 
     def compute_encoded_ATP_R(self, normalized_ATP, ATP_R):
@@ -179,7 +186,18 @@ class ATP_R_Transf(nn.Module):
             x = layer(x)  # Shape remains [B, N+1, hidden_dim]
 
         # Pooling: Use the CLS token
-        x = x.mean(dim = 1) if self.pool == 'mean' else x[:, 0]
+        # Ido and Yaniv: another change here - we don't want to average over cls, and we want to support mean-max
+        x_tokens = x[:, 1:, :]
+        x_cls = x[:, 0, :]
+        x = None
+        if self.pool == 'cls':
+            x = x_cls
+        elif self.pool == 'mean':
+            x = x_tokens.mean(dim=1)
+        elif self.pool == 'mean_max':
+            x = torch.cat([x_tokens.mean(dim=1), x_tokens.max(dim=1).values], dim=-1)
+        else:
+            raise ValueError("Pooling type is not supported")
 
         # Final classification head
         x = self.mlp_head(x)  # Shape: [B, 1]
@@ -199,8 +217,9 @@ class LOS_Net(nn.Module):
         self.dropout = args.dropout
         self.num_layers = args.num_layers
         self.pool = args.pool
-        
-        assert self.pool in {'cls', 'mean'}, "Pool type must be either 'cls' (CLS token) or 'mean' (mean pooling)"
+
+        assert self.pool in {'cls', 'mean', 'mean_max'}, ('pool type must be either cls (cls token),mean (mean pooling)'
+                                                          ' or mean_max (mean-max polling)')
         
         self.param_for_normalized_ATP = nn.Parameter(torch.randn(1, 1, self.hidden_dim // 2))
 
@@ -239,7 +258,12 @@ class LOS_Net(nn.Module):
         ])
         
         # Classification head
-        self.mlp_head = nn.Linear(self.hidden_dim, 1)
+        # Ido and Yaniv:
+        # first change done here - head's input dim modification in order to support mean-max polling
+        head_in = self.hidden_dim
+        if self.pool == 'mean_max':
+            head_in *= 2
+        self.mlp_head = nn.Linear(head_in, 1)
         self.sigmoid = nn.Sigmoid()
 
     def compute_encoded_ATP_R(self, normalized_ATP, ATP_R):
@@ -295,8 +319,19 @@ class LOS_Net(nn.Module):
             x = layer(x)
         
         # Pooling
-        x = x.mean(dim=1) if self.pool == 'mean' else x[:, 0]
-        
+        # Ido and Yaniv: another change here - we don't want to average over cls, and we want to support mean-max
+        x_tokens = x[:, 1:, :]
+        x_cls = x[:, 0, :]
+        x = None
+        if self.pool == 'cls':
+            x = x_cls
+        elif self.pool == 'mean':
+            x = x_tokens.mean(dim=1)
+        elif self.pool == 'mean_max':
+            x = torch.cat([x_tokens.mean(dim=1), x_tokens.max(dim=1).values], dim=-1)
+        else:
+            raise ValueError("Pooling type is not supported")
+
         # Classification head
         x = self.mlp_head(x)
         return self.sigmoid(x).squeeze(-1)
