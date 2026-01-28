@@ -214,7 +214,7 @@ class ATP_R_Transf(nn.Module):
         elif self.pool == 'attn':
             scores = self.attn_pool(x_tokens).squeeze(-1)
             w = torch.softmax(scores, dim=1)
-            x = (x_tokens * weights.unsqueeze(-1)).sum(dim=1)
+            x = (x_tokens * w.unsqueeze(-1)).sum(dim=1)
         else:
             raise ValueError("Pooling type is not supported")
 
@@ -369,7 +369,7 @@ class LOS_Net(nn.Module):
         elif self.pool == 'attn':
             scores = self.attn_pool(x_tokens).squeeze(-1)
             w = torch.softmax(scores, dim=1)
-            x = (x_tokens * weights.unsqueeze(-1)).sum(dim=1)
+            x = (x_tokens * w.unsqueeze(-1)).sum(dim=1)
 
         else:
             raise ValueError("Pooling type is not supported")
