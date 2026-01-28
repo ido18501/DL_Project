@@ -101,15 +101,21 @@ class ATP_R_Transf(nn.Module):
         self.input_dim = input_dim
         self.max_sequence_length = max_sequence_length
         self.hidden_dim = args.hidden_dim
+        # Ido and Yaniv- add attn pooling layer
+        self.attn_pool = nn.Linear(self.hidden_dim, 1)
+
         self.heads = args.heads
         self.dropout = args.dropout
         self.num_layers = args.num_layers
         self.pool = args.pool
-        assert self.pool in {'cls', 'mean', 'mean_max','mean_cls', 'mean_max_cls'}, ('pool type must be either cls '
+        assert self.pool in {'cls', 'mean', 'mean_max','mean_cls', 'mean_max_cls', 'attn'},('pool type must be either '
+                                                                                            'cls '
                                                                                      '(cls token),mean (mean pooling)' 
                                                                                      ' or mean_max (mean-max polling)'
                                                                                      'mean/mean_max _cls is '
-                                                                                     'also allowed to combine')
+                                                                                     'also allowed to combine; attn is'
+                                                                                            ' supported for attention'
+                                                                                            ' layer')
 
         self.param_for_normalized_ATP = nn.Parameter(torch.randn(1, 1, self.hidden_dim))
         if self.args.rank_encoding == 'scale_encoding':
@@ -190,6 +196,8 @@ class ATP_R_Transf(nn.Module):
 
         # Pooling: Use the CLS token
         # Ido and Yaniv: another change here - we don't want to average over cls, and we want to support mean-max
+        # second change: allowing mean/mean_max to combine cls
+        # third change: adding support for attention pooling
         x_tokens = x[:, 1:, :]
         x_cls = x[:, 0, :]
         x = None
@@ -203,6 +211,10 @@ class ATP_R_Transf(nn.Module):
             x = torch.cat([x_tokens.mean(dim=1), x_cls], dim=-1)
         elif self.pool == 'mean_max_cls':
             x = torch.cat([x_tokens.mean(dim=1), x_tokens.max(dim=1).values, x_cls], dim=-1)
+        elif self.pool == 'attn':
+            scores = self.attn_pool(x_tokens).squeeze(-1)
+            w = torch.softmax(scores, dim=1)
+            x = (x_tokens * weights.unsqueeze(-1)).sum(dim=1)
         else:
             raise ValueError("Pooling type is not supported")
 
@@ -220,16 +232,22 @@ class LOS_Net(nn.Module):
         self.max_sequence_length = max_sequence_length
         self.input_dim = input_dim
         self.hidden_dim = args.hidden_dim
+        # Ido and Yaniv- add attn pooling layer
+        self.attn_pool = nn.Linear(self.hidden_dim, 1)
+
         self.heads = args.heads
         self.dropout = args.dropout
         self.num_layers = args.num_layers
         self.pool = args.pool
-
-        assert self.pool in {'cls', 'mean', 'mean_max', 'mean_cls', 'mean_max_cls'}, ('pool type must be either cls '
-                                                                                      '(cls token),mean (mean pooling)'
-                                                                                      ' or mean_max (mean-max polling)'
-                                                                                      'mean/mean_max _cls is '
-                                                                                      'also allowed to combine')
+        assert self.pool in {'cls', 'mean', 'mean_max', 'mean_cls', 'mean_max_cls', 'attn'}, (
+            'pool type must be either '
+            'cls '
+            '(cls token),mean (mean pooling)'
+            ' or mean_max (mean-max polling)'
+            'mean/mean_max _cls is '
+            'also allowed to combine; attn is'
+            ' supported for attention'
+            ' layer')
         
         self.param_for_normalized_ATP = nn.Parameter(torch.randn(1, 1, self.hidden_dim // 2))
 
@@ -333,6 +351,8 @@ class LOS_Net(nn.Module):
         
         # Pooling
         # Ido and Yaniv: another change here - we don't want to average over cls, and we want to support mean-max
+        # second change: allowing mean/mean_max to combine cls
+        # third change: adding support for attention pooling
         x_tokens = x[:, 1:, :]
         x_cls = x[:, 0, :]
         x = None
@@ -346,6 +366,11 @@ class LOS_Net(nn.Module):
             x = torch.cat([x_tokens.mean(dim=1), x_cls], dim=-1)
         elif self.pool == 'mean_max_cls':
             x = torch.cat([x_tokens.mean(dim=1), x_tokens.max(dim=1).values, x_cls], dim=-1)
+        elif self.pool == 'attn':
+            scores = self.attn_pool(x_tokens).squeeze(-1)
+            w = torch.softmax(scores, dim=1)
+            x = (x_tokens * weights.unsqueeze(-1)).sum(dim=1)
+
         else:
             raise ValueError("Pooling type is not supported")
 
