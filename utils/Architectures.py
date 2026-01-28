@@ -105,8 +105,11 @@ class ATP_R_Transf(nn.Module):
         self.dropout = args.dropout
         self.num_layers = args.num_layers
         self.pool = args.pool
-        assert self.pool in {'cls', 'mean', 'mean_max'}, ('pool type must be either cls (cls token),mean (mean pooling)'
-                                                          ' or mean_max (mean-max polling)')
+        assert self.pool in {'cls', 'mean', 'mean_max','mean_cls', 'mean_max_cls'}, ('pool type must be either cls '
+                                                                                     '(cls token),mean (mean pooling)' 
+                                                                                     ' or mean_max (mean-max polling)'
+                                                                                     'mean/mean_max _cls is '
+                                                                                     'also allowed to combine')
 
         self.param_for_normalized_ATP = nn.Parameter(torch.randn(1, 1, self.hidden_dim))
         if self.args.rank_encoding == 'scale_encoding':
@@ -218,8 +221,11 @@ class LOS_Net(nn.Module):
         self.num_layers = args.num_layers
         self.pool = args.pool
 
-        assert self.pool in {'cls', 'mean', 'mean_max'}, ('pool type must be either cls (cls token),mean (mean pooling)'
-                                                          ' or mean_max (mean-max polling)')
+        assert self.pool in {'cls', 'mean', 'mean_max', 'mean_cls', 'mean_max_cls'}, ('pool type must be either cls '
+                                                                                      '(cls token),mean (mean pooling)'
+                                                                                      ' or mean_max (mean-max polling)'
+                                                                                      'mean/mean_max _cls is '
+                                                                                      'also allowed to combine')
         
         self.param_for_normalized_ATP = nn.Parameter(torch.randn(1, 1, self.hidden_dim // 2))
 
@@ -260,9 +266,12 @@ class LOS_Net(nn.Module):
         # Classification head
         # Ido and Yaniv:
         # first change done here - head's input dim modification in order to support mean-max polling
+        # second change - combining cls with man and mean-max
         head_in = self.hidden_dim
-        if self.pool == 'mean_max':
+        if self.pool in {'mean_max', 'mean_cls'}:
             head_in *= 2
+        elif self.pool == 'mean_max_cls':
+            head_in = 3 * self.hidden_dim
         self.mlp_head = nn.Linear(head_in, 1)
         self.sigmoid = nn.Sigmoid()
 
@@ -329,6 +338,10 @@ class LOS_Net(nn.Module):
             x = x_tokens.mean(dim=1)
         elif self.pool == 'mean_max':
             x = torch.cat([x_tokens.mean(dim=1), x_tokens.max(dim=1).values], dim=-1)
+        elif self.pool == 'mean_cls':
+            x = torch.cat([x_tokens.mean(dim=1)], x_cls, dim=-1)
+        elif self.pool == 'mean_max_cls':
+            x = torch.cat([x_tokens.mean(dim=1), x_tokens.max(dim=1).values, x_cls], dim=-1)
         else:
             raise ValueError("Pooling type is not supported")
 
