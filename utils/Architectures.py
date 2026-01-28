@@ -199,6 +199,10 @@ class ATP_R_Transf(nn.Module):
             x = x_tokens.mean(dim=1)
         elif self.pool == 'mean_max':
             x = torch.cat([x_tokens.mean(dim=1), x_tokens.max(dim=1).values], dim=-1)
+        elif self.pool == 'mean_cls':
+            x = torch.cat([x_tokens.mean(dim=1), x_cls], dim=-1)
+        elif self.pool == 'mean_max_cls':
+            x = torch.cat([x_tokens.mean(dim=1), x_tokens.max(dim=1).values, x_cls], dim=-1)
         else:
             raise ValueError("Pooling type is not supported")
 
@@ -339,7 +343,7 @@ class LOS_Net(nn.Module):
         elif self.pool == 'mean_max':
             x = torch.cat([x_tokens.mean(dim=1), x_tokens.max(dim=1).values], dim=-1)
         elif self.pool == 'mean_cls':
-            x = torch.cat([x_tokens.mean(dim=1)], x_cls, dim=-1)
+            x = torch.cat([x_tokens.mean(dim=1), x_cls], dim=-1)
         elif self.pool == 'mean_max_cls':
             x = torch.cat([x_tokens.mean(dim=1), x_tokens.max(dim=1).values, x_cls], dim=-1)
         else:
