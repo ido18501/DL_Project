@@ -251,6 +251,8 @@ class LOS_Net(nn.Module):
         self.hidden_dim = args.hidden_dim
         # Ido and Yaniv- add attn pooling layer
         self.attn_pool = nn.Linear(self.hidden_dim, 1)
+        # Ido and Yaniv - project augmented token features back to model hidden_dim
+        self.fuse_proj = nn.Linear(self.hidden_dim + self.hidden_dim // 2, self.hidden_dim)
 
         self.heads = args.heads
         self.dropout = args.dropout
@@ -284,7 +286,10 @@ class LOS_Net(nn.Module):
         
         # Input embedding layer
         self.input_proj = nn.Linear(input_dim, self.hidden_dim // 2)
-        
+
+        # Ido and Yaniv - additional uncertainty features (entropy/margin/top1) projection
+        self.uncertainty_proj = nn.Linear(3, self.hidden_dim // 2)
+
         # CLS token
         self.cls_token = nn.Parameter(torch.randn(1, 1, self.hidden_dim))
         
@@ -349,10 +354,34 @@ class LOS_Net(nn.Module):
         
         # Encoding normalized vocab
         encoded_sorted_TDS_normalized = self.input_proj(sorted_TDS_normalized.to(torch.float32))
-        
+
+        # Ido and Yaniv - compute uncertainty features from top-K probabilities
+        p = sorted_TDS_normalized.to(torch.float32)  # [B, N, K]
+        eps = 1e-12
+
+        p1 = p[..., 0]  # [B, N]
+        if p.size(-1) >= 2:
+            margin = p[..., 0] - p[..., 1]  # [B, N]
+        else:
+            margin = torch.zeros_like(p1)
+
+        entropy = -(p * (p + eps).log()).sum(dim=-1)  # [B, N]
+
+        u = torch.stack([p1, margin, entropy], dim=-1)  # [B, N, 3]
+        encoded_uncertainty = self.uncertainty_proj(u)  # [B, N, hidden_dim//2]
+
         # Concatenating embeddings
         x = torch.cat((encoded_sorted_TDS_normalized, encoded_ATP_R + encoded_normalized_ATP), dim=-1)
-        
+
+        # Ido and Yaniv - include uncertainty embedding in the token representation
+        x = torch.cat(
+            (encoded_sorted_TDS_normalized, encoded_uncertainty, encoded_ATP_R + encoded_normalized_ATP),
+            dim=-1
+        )
+
+        # Ido and Yaniv - fuse to hidden_dim for transformer
+        x = self.fuse_proj(x)
+
         # Adding CLS token
         b, n, _ = x.shape
         cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b=b)
