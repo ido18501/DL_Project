@@ -222,10 +222,15 @@ class ATP_R_Transf(nn.Module):
             x = torch.cat([x_mean, x_cls], dim=-1)
         elif self.pool == 'mean_max_cls':
             x = torch.cat([x_mean, x_max, x_cls], dim=-1)
-        elif self.pool == 'attn':
+            elif self.pool == 'attn':
             scores = self.attn_pool(x_tokens).squeeze(-1)
             scores = scores.masked_fill(~token_mask, float('-inf'))
             weights = torch.softmax(scores, dim=1)
+
+            # Ido and Yaniv - store attention entropy for regularization (robustness)
+            eps = 1e-12
+            self.attn_entropy = -(weights * (weights + eps).log()).sum(dim=1).mean()
+
             x = (x_tokens * weights.unsqueeze(-1)).sum(dim=1)
         else:
             raise ValueError("Pooling type is not supported")
@@ -393,7 +398,13 @@ class LOS_Net(nn.Module):
             scores = self.attn_pool(x_tokens).squeeze(-1)
             scores = scores.masked_fill(~token_mask, float('-inf'))
             weights = torch.softmax(scores, dim=1)
+
+            # Ido and Yaniv - store attention entropy for regularization (robustness)
+            eps = 1e-12
+            self.attn_entropy = -(weights * (weights + eps).log()).sum(dim=1).mean()
+
             x = (x_tokens * weights.unsqueeze(-1)).sum(dim=1)
+
         else:
             raise ValueError("Pooling type is not supported")
 

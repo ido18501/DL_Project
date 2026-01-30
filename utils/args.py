@@ -100,9 +100,10 @@ def parse_args_HD():
         default=MAXIMAL_VOCAB_SIZE,
         help="Top-K to use when extracting the raw dataset -- should be max over all vocab sizes (default: 1_000_000)."
     )
-    
 
-    
+    # Ido and Yaniv - entropy regularization strength for attention pooling
+    parser.add_argument("--attn_entropy_lambda", type=float, default=1e-3)
+
     return parser.parse_args()
 
 

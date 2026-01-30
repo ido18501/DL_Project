@@ -71,7 +71,6 @@ dependencies:
       - appdirs==1.4.4
       - async-timeout==5.0.1
       - attrs==24.2.0
-      - baukit==0.0.1
       - certifi==2024.8.30
       - charset-normalizer==3.4.0
       - click==8.1.7

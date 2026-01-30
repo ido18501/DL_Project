@@ -129,6 +129,9 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
         else:
             raise ValueError("Invalid input type.")
         loss = criterion(predictions, labels.float())
+        #Ido and yaniv - for attention pooling we had the entropy loss
+        if hasattr(model, "attn") and model.attn_entropy is not None:
+            loss = loss - args.attn_entropy_lambda * model.attn_entropy
         loss.backward()
         optimizer.step()
         scheduler.step()
