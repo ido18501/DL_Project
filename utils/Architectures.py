@@ -222,7 +222,7 @@ class ATP_R_Transf(nn.Module):
             x = torch.cat([x_mean, x_cls], dim=-1)
         elif self.pool == 'mean_max_cls':
             x = torch.cat([x_mean, x_max, x_cls], dim=-1)
-            elif self.pool == 'attn':
+        elif self.pool == 'attn':
             scores = self.attn_pool(x_tokens).squeeze(-1)
             scores = scores.masked_fill(~token_mask, float('-inf'))
             weights = torch.softmax(scores, dim=1)
@@ -355,17 +355,17 @@ class LOS_Net(nn.Module):
         # Encoding normalized vocab
         encoded_sorted_TDS_normalized = self.input_proj(sorted_TDS_normalized.to(torch.float32))
 
-        # Ido and Yaniv - compute uncertainty features from top-K probabilities
+        # Ido and Yaniv - compute uncertainty features from top-K probabilities (robust)
         p = sorted_TDS_normalized.to(torch.float32)  # [B, N, K]
         eps = 1e-12
 
-        p1 = p[..., 0]  # [B, N]
-        if p.size(-1) >= 2:
-            margin = p[..., 0] - p[..., 1]  # [B, N]
-        else:
-            margin = torch.zeros_like(p1)
+        # Clamp in case tensor isn't strictly probabilities due to preprocessing quirks
+        p = torch.clamp(p, min=0.0, max=1.0)
 
-        entropy = -(p * (p + eps).log()).sum(dim=-1)  # [B, N]
+        p1 = p[..., 0]  # [B, N]
+        margin = p[..., 0] - p[..., 1] if p.size(-1) >= 2 else torch.zeros_like(p1)
+
+        entropy = -(p * (p.clamp_min(eps)).log()).sum(dim=-1)  # [B, N]
 
         u = torch.stack([p1, margin, entropy], dim=-1)  # [B, N, 3]
         encoded_uncertainty = self.uncertainty_proj(u)  # [B, N, hidden_dim//2]
