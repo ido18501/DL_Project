@@ -353,25 +353,26 @@ class LOS_Net(nn.Module):
         token_mask = (sorted_TDS_normalized.abs().sum(dim=-1) > 0)  # [B, N]
 
         # Encoding normalized mark
-        encoded_normalized_ATP = normalized_ATP * self.param_for_normalized_ATP
+        token_mask = (sorted_TDS_normalized.abs().sum(dim=-1) > 0)
+        #if self.training and hasattr(self, "keep_mask"):
+         #   token_mask = token_mask & self.keep_mask
         
         
         # Encoding normalized vocab
         encoded_sorted_TDS_normalized = self.input_proj(sorted_TDS_normalized.to(torch.float32))
 
         # Ido and Yaniv - compute uncertainty features from top-K probabilities (robust)
-        p = sorted_TDS_normalized.to(torch.float32)  # [B, N, K]
-        eps = 1e-12
+        p = sorted_TDS_normalized.to(torch.float32)
 
-        # Ido and yaniv - trying adding noise to data
         if self.training:
-            sigma = getattr(self.args, "feat_noise", 0.02)
+            sigma = getattr(self.args, "feat_noise", 0.0)  # default 0.0 is safer
             if sigma > 0:
                 p = p + sigma * torch.randn_like(p)
 
-        # Clamp in case tensor isn't strictly probabilities due to preprocessing quirks
         p = torch.clamp(p, 0.0, 1.0)
 
+        # Ido and Yaniv - we use the same p for the main embedding, thus overriding
+        encoded_sorted_TDS_normalized = self.input_proj(p)
 
         # Ido and Yaniv- uncertainty embeddings including gini (KL divergance)
         p1 = p[..., 0]

@@ -127,10 +127,11 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
             optimizer.zero_grad()
             # Ido and Yaniv -using logits
             logits = model(sorted_TDS_normalized, normalized_ATP, ATP_R).reshape(-1)
-            predictions = torch.sigmoid(logits).reshape(-1)
+            predictions = torch.sigmoid(logits)
         else:
             raise ValueError("Invalid input type.")
-        loss = criterion(predictions, labels.float())
+        # Ido and Yaniv - logits
+        loss = criterion(logits, labels.float())
         #Ido and yaniv - for attention pooling we had the entropy loss
         if hasattr(model, "attn") and model.attn_entropy is not None:
             loss = loss - args.attn_entropy_lambda * model.attn_entropy
@@ -162,7 +163,7 @@ def evaluate(model, dataloader, criterion, device, desc="Validation", input_type
             else:
                 raise ValueError("Invalid input type.")
                 
-            loss = criterion(predictions, labels.float())
+            loss = criterion(logits, labels.float())
             total_loss += loss.item()
             
             all_labels.extend(labels.cpu().tolist())
