@@ -289,7 +289,8 @@ class LOS_Net(nn.Module):
         self.input_proj = nn.Linear(input_dim, self.hidden_dim // 2)
 
         # Ido and Yaniv - additional uncertainty features (entropy/margin/top1) projection
-        self.uncertainty_proj = nn.Linear(3, self.hidden_dim // 2)
+        self.uncertainty_proj = nn.Linear(4, self.hidden_dim // 2)
+
 
         # CLS token
         self.cls_token = nn.Parameter(torch.randn(1, 1, self.hidden_dim))
@@ -371,13 +372,15 @@ class LOS_Net(nn.Module):
         # Clamp in case tensor isn't strictly probabilities due to preprocessing quirks
         p = torch.clamp(p, 0.0, 1.0)
 
-        p1 = p[..., 0]  # [B, N]
+
+        # Ido and Yaniv- uncertainty embeddings including gini (KL divergance)
+        p1 = p[..., 0]
         margin = p[..., 0] - p[..., 1] if p.size(-1) >= 2 else torch.zeros_like(p1)
-
         entropy = -(p * (p.clamp_min(eps)).log()).sum(dim=-1)  # [B, N]
+        gini = (p * p).sum(dim=-1)
 
-        u = torch.stack([p1, margin, entropy], dim=-1)  # [B, N, 3]
-        encoded_uncertainty = self.uncertainty_proj(u)  # [B, N, hidden_dim//2]
+        u = torch.stack([p1, margin, entropy, gini], dim=-1)
+        encoded_uncertainty = self.uncertainty_proj(u)
 
         # Concatenating embeddings
         x = torch.cat((encoded_sorted_TDS_normalized, encoded_ATP_R + encoded_normalized_ATP), dim=-1)
