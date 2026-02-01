@@ -125,7 +125,9 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
         if input_type == 'LOS':
             sorted_TDS_normalized, normalized_ATP, ATP_R, labels = batch
             optimizer.zero_grad()
-            predictions = model(sorted_TDS_normalized, normalized_ATP, ATP_R).reshape(-1)
+            # Ido and Yaniv -using logits
+            logits = model(sorted_TDS_normalized, normalized_ATP, ATP_R).reshape(-1)
+            predictions = torch.sigmoid(logits).reshape(-1)
         else:
             raise ValueError("Invalid input type.")
         loss = criterion(predictions, labels.float())
@@ -154,7 +156,9 @@ def evaluate(model, dataloader, criterion, device, desc="Validation", input_type
             batch = [item.to(device) for item in batch]
             if input_type == 'LOS':
                 sorted_TDS_normalized, normalized_ATP, ATP_R, labels = batch
-                predictions = model(sorted_TDS_normalized, normalized_ATP, ATP_R).reshape(-1)
+                # Ido and Yaniv -using logits
+                logits = model(sorted_TDS_normalized, normalized_ATP, ATP_R).reshape(-1)
+                predictions = torch.sigmoid(logits).reshape(-1)
             else:
                 raise ValueError("Invalid input type.")
                 
@@ -297,6 +301,21 @@ def main():
         pin_memory=True if args.pin_memory==1 else False
     )
 
+    
+    # Ido and Yaniv -balancing labels
+    pos = 0
+    neg = 0
+    for batch in dataloader_train:
+        labels = batch[-1]  # last item is labels
+        pos += (labels == 1).sum().item()
+        neg += (labels == 0).sum().item()
+
+    print(f"[TRAIN] pos={pos} neg={neg} pos_frac={pos / (pos + neg + 1e-9):.4f}")
+    pos_weight = neg / max(pos, 1)
+    print(f"[TRAIN] pos_weight = {pos_weight:.4f}")
+
+
+
     dataloader_val = DataLoader(
         val_data,          # Your dataset instance
         batch_size=args.batch_size,     # Number of samples per batch
@@ -342,8 +361,10 @@ def main():
     scheduler = get_scheduler(
         "linear", optimizer=optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps
     )
-    
-    criterion = torch.nn.BCELoss()
+
+    # Ido and yaniv - using logits and balancing labels
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device))
+
     
     
     random_number = str(int(time.time() * 1e6) % (10**10))

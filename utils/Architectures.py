@@ -88,8 +88,8 @@ class ATP_R_MLP(nn.Module):
                 x = F.relu(x)
                 x = F.dropout(x, p=self.dropout)
 
-
-        return self.sigmoid(x).squeeze(-1)  # Apply sigmoid for binary classification
+        # Ido and yaniv- trying logits instead of sigmoid
+        return x.squeeze(-1)
 
 
 class ATP_R_Transf(nn.Module):
@@ -237,8 +237,9 @@ class ATP_R_Transf(nn.Module):
 
         # Final classification head
         x = self.mlp_head(x)  # Shape: [B, 1]
-        
-        return self.sigmoid(x).squeeze(-1)  # Apply sigmoid for binary classification
+
+        # Ido and yaniv- trying logits instead of sigmoid
+        return x.squeeze(-1)
     
 
 class LOS_Net(nn.Module):
@@ -453,6 +454,9 @@ class LOS_Net(nn.Module):
 
         # Classification head
         x = self.mlp_head(x)
-        return self.sigmoid(x).squeeze(-1)
+
+        # Ido and yaniv- trying logits instead of sigmoid
+        return x.squeeze(-1)
+
    
 ######################## LOS ########################
