@@ -329,9 +329,10 @@ def parse_args_main():
         default=1,
         help="pin memory (default: 4)."
     )
-    
 
-
+    # Ido and Yaniv - token dropout and noise adding (for training)
+    parser.add_argument("--feat_noise", type=float, default=0.0)
+    parser.add_argument("--token_dropout", type=float, default=0.0)
 
     return parser.parse_args()
 
