@@ -350,10 +350,9 @@ class LOS_Net(nn.Module):
             raise ValueError("Invalid encoding type. Please choose either 'scale_encoding' or 'one_hot_encoding'.")
             
         # Ido and Yaniv- token masking
-        token_mask = (sorted_TDS_normalized.abs().sum(dim=-1) > 0)  # [B, N]
-
-        # Encoding normalized mark
         token_mask = (sorted_TDS_normalized.abs().sum(dim=-1) > 0)
+        encoded_normalized_ATP = normalized_ATP * self.param_for_normalized_ATP
+
         #if self.training and hasattr(self, "keep_mask"):
          #   token_mask = token_mask & self.keep_mask
         
