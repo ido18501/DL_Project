@@ -375,6 +375,7 @@ class LOS_Net(nn.Module):
         encoded_sorted_TDS_normalized = self.input_proj(p)
 
         # Ido and Yaniv- uncertainty embeddings including gini (KL divergance)
+        eps = 1e-12
         p1 = p[..., 0]
         margin = p[..., 0] - p[..., 1] if p.size(-1) >= 2 else torch.zeros_like(p1)
         entropy = -(p * (p.clamp_min(eps)).log()).sum(dim=-1)  # [B, N]
