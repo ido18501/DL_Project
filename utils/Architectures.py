@@ -347,7 +347,9 @@ class LOS_Net(nn.Module):
         else:
             raise ValueError("Invalid encoding type. Please choose either 'scale_encoding' or 'one_hot_encoding'.")
             
-        
+        # Ido and Yaniv- token masking
+        token_mask = (sorted_TDS_normalized.abs().sum(dim=-1) > 0)  # [B, N]
+
         # Encoding normalized mark
         encoded_normalized_ATP = normalized_ATP * self.param_for_normalized_ATP
         
@@ -359,8 +361,14 @@ class LOS_Net(nn.Module):
         p = sorted_TDS_normalized.to(torch.float32)  # [B, N, K]
         eps = 1e-12
 
+        # Ido and yaniv - trying adding noise to data
+        if self.training:
+            sigma = getattr(self.args, "feat_noise", 0.02)
+            if sigma > 0:
+                p = p + sigma * torch.randn_like(p)
+
         # Clamp in case tensor isn't strictly probabilities due to preprocessing quirks
-        p = torch.clamp(p, min=0.0, max=1.0)
+        p = torch.clamp(p, 0.0, 1.0)
 
         p1 = p[..., 0]  # [B, N]
         margin = p[..., 0] - p[..., 1] if p.size(-1) >= 2 else torch.zeros_like(p1)
@@ -382,6 +390,12 @@ class LOS_Net(nn.Module):
         # Ido and Yaniv - fuse to hidden_dim for transformer
         x = self.fuse_proj(x)
 
+        # Ido and Yaniv - token dropout
+        if self.training:
+            drop_p = getattr(self.args, "token_dropout", 0.2)  # try 0.1–0.3
+            if drop_p > 0:
+                keep = (torch.rand_like(token_mask.float()) > drop_p) & token_mask
+                x = x * keep.unsqueeze(-1).float()
         # Adding CLS token
         b, n, _ = x.shape
         cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b=b)

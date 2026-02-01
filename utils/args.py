@@ -104,6 +104,9 @@ def parse_args_HD():
     # Ido and Yaniv - entropy regularization strength for attention pooling
     parser.add_argument("--attn_entropy_lambda", type=float, default=1e-3)
 
+    # Ido and Yaniv- token dropout and noise adding
+    parser.add_argument("--feat_noise", type=float, default=0.0)
+    parser.add_argument("--token_dropout", type=float, default=0.0)
     return parser.parse_args()
 
 
