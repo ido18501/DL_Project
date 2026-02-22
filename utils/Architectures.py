@@ -368,10 +368,7 @@ class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
 def get_model(args, max_sequence_length, actual_sequence_length, input_dim, input_shape):
     model_mapping = {
         # LOS-based
-        'LOS-Net': LOS_Net,
         'LOS++': LOS_PP_MultiScaleDeltaTransformer,   # <-- add this
-        'ATP_R_MLP': ATP_R_MLP,
-        'ATP_R_Transf': ATP_R_Transf,
     }
 
     if args.probe_model in {'LOS-Net', 'LOS++', 'ATP_R_Transf'}:
