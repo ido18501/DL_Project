@@ -917,36 +917,37 @@ class LOS_GRU(nn.Module):
             d += 5  # mean_p, std_p, max_p, mean_logp, std_logp
 
         return d
-    def _token_features(self, sorted_TDS_normalized: torch.Tensor) -> torch.Tensor:
-        """
-        sorted_TDS_normalized: [B, N, V]
-        returns: [B, N, base_feat_dim]
-        """
-        p = sorted_TDS_normalized.to(torch.float32)
 
+    def _token_features(self, sorted_TDS_normalized: torch.Tensor) -> torch.Tensor:
+        p = sorted_TDS_normalized.to(torch.float32)
         feats = []
 
-        # dynamics (very HALT/EPR-aligned)
-        # dynamics (very HALT/EPR-aligned)
+        # --- entropy block ---
         if self.use_entropy:
             H = _safe_entropy(p)  # [B,N,1]
-            dH = _delta_feat(H)
-            feats.append(dH)
-            feats.append(_rolling_mean(dH, w=4))
-            feats.append(_rolling_var(dH, w=4))
+            feats.append(H)  # <-- add H (missing)
 
+            if self.use_dynamics:
+                dH = _delta_feat(H)
+                feats.append(dH)
+                feats.append(_rolling_mean(dH, w=self.roll_window))
+                feats.append(_rolling_var(dH, w=self.roll_window))
+
+        # --- margin block ---
         if self.use_margin:
             p1 = p[..., 0:1]
             p2 = p[..., 1:2] if p.size(-1) > 1 else torch.zeros_like(p1)
-            margin = (p1 - p2)
-            logp1 = _safe_log(p1)
+            margin = (p1 - p2)  # [B,N,1]
+            logp1 = _safe_log(p1)  # [B,N,1]
 
-            dlogp1 = _delta_feat(logp1)
-            dmargin = _delta_feat(margin)
+            feats.append(margin)  # <-- add margin (missing)
+            feats.append(logp1)  # <-- add logp1 (missing)
 
-            feats.append(dlogp1)
-            feats.append(dmargin)
+            if self.use_dynamics:
+                feats.append(_delta_feat(logp1))  # dlogp1
+                feats.append(_delta_feat(margin))  # dmargin
 
+        # --- top stats block ---
         if self.use_top_stats:
             mean_p = p.mean(dim=-1, keepdim=True)
             std_p = p.std(dim=-1, keepdim=True, unbiased=False)
