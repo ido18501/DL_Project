@@ -37,22 +37,22 @@ def _delta_feat(x: torch.Tensor) -> torch.Tensor:
     return torch.cat([zero, dx], dim=1)
 
 def _rolling_mean(x: torch.Tensor, w: int = 4) -> torch.Tensor:
-    # x: [B,N,1] -> [B,N,1] (causal simple average)
+    # causal rolling mean, SAME length as x
+    # x: [B,N,1] -> [B,N,1]
     if w <= 1:
         return x
-    # pad left
-    pad = torch.zeros_like(x[:, :w-1])
-    xp = torch.cat([pad, x], dim=1)          # [B, N+w-1, 1]
-    # cumulative sum for O(N)
-    cs = xp.cumsum(dim=1)
-    out = (cs[:, w:] - cs[:, :-w]) / float(w)  # [B,N,1]
-    return out
+    xt = x.transpose(1, 2)                 # [B,1,N]
+    xt = F.pad(xt, (w - 1, 0))             # left pad only -> [B,1,N+w-1]
+    out = F.avg_pool1d(xt, kernel_size=w, stride=1)  # -> [B,1,N]
+    return out.transpose(1, 2)             # [B,N,1]
 
 def _rolling_var(x: torch.Tensor, w: int = 4) -> torch.Tensor:
+    # causal rolling variance, SAME length as x
+    if w <= 1:
+        return torch.zeros_like(x)
     m = _rolling_mean(x, w)
     m2 = _rolling_mean(x * x, w)
-    v = (m2 - m * m).clamp_min(0.0)
-    return v
+    return (m2 - m * m).clamp_min(0.0)
 
 def get_model(args, max_sequence_length, actual_sequence_length, input_dim, input_shape):
     """
