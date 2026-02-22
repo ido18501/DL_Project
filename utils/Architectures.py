@@ -29,6 +29,31 @@ from utils.constants import MODEL_VOCAB_SIZES
 # Public factory (API contract)
 # ---------------------------
 
+
+def _delta_feat(x: torch.Tensor) -> torch.Tensor:
+    # x: [B,N,1] -> [B,N,1], with x[:,0]=0
+    dx = x[:, 1:] - x[:, :-1]
+    zero = torch.zeros_like(x[:, :1])
+    return torch.cat([zero, dx], dim=1)
+
+def _rolling_mean(x: torch.Tensor, w: int = 4) -> torch.Tensor:
+    # x: [B,N,1] -> [B,N,1] (causal simple average)
+    if w <= 1:
+        return x
+    # pad left
+    pad = torch.zeros_like(x[:, :w-1])
+    xp = torch.cat([pad, x], dim=1)          # [B, N+w-1, 1]
+    # cumulative sum for O(N)
+    cs = xp.cumsum(dim=1)
+    out = (cs[:, w:] - cs[:, :-w]) / float(w)  # [B,N,1]
+    return out
+
+def _rolling_var(x: torch.Tensor, w: int = 4) -> torch.Tensor:
+    m = _rolling_mean(x, w)
+    m2 = _rolling_mean(x * x, w)
+    v = (m2 - m * m).clamp_min(0.0)
+    return v
+
 def get_model(args, max_sequence_length, actual_sequence_length, input_dim, input_shape):
     """
     Args:
@@ -343,12 +368,26 @@ class LOS_Net(nn.Module):
 # ---------------------------
 
 class LOS_GRU(nn.Module):
+    """
+    HALT-style time-series classifier for hallucination detection.
+
+    Key idea:
+    - Convert per-token top-k distribution into a small set of uncertainty/stat features.
+    - Concatenate with ATP-based features (normalized_ATP + rank encoding).
+    - Run a (bi)GRU over token time steps.
+    - Pool + classify.
+
+    This is designed to:
+    - reduce overfitting (lower effective capacity, stronger inductive bias)
+    - converge with fewer epochs
+    """
     def __init__(self, args, max_sequence_length: int, input_dim: int = 1000):
         super().__init__()
         self.args = args
         self.max_sequence_length = max_sequence_length
         self.input_dim = input_dim
 
+        # We use hidden_dim as GRU hidden size (keep it small in sweeps: 64/96/128)
         self.hidden_dim = args.hidden_dim
         self.dropout = args.dropout
         self.num_layers = max(1, int(getattr(args, "num_layers", 1)))
@@ -361,26 +400,27 @@ class LOS_GRU(nn.Module):
         self.use_top_stats = True
         self.use_atp = True
 
-        # HALT-style additions
-        self.raw_k = int(getattr(args, "raw_topk", 20))
-        self.topq = float(getattr(args, "topq", 0.2))
-        self.use_alt_entropy = bool(getattr(args, "alt_entropy", True))
-        self.use_binary_entropy_delta = bool(getattr(args, "bin_ent_delta", True))
-        self.use_raw_logp = bool(getattr(args, "raw_logp", True))
-
+        # ATP encoder -> small vector
+        # We keep ATP encoding width modest to avoid overfitting.
         atp_dim = int(getattr(args, "atp_feature_dim", max(8, self.hidden_dim // 8)))
         self.atp_encoder = RankATPEncoder(args=args, hidden_dim=atp_dim) if self.use_atp else None
 
+        # Build per-token feature dimension from top-k distribution
+        # Features (all per token):
+        # - entropy(topk)               [1]
+        # - margin(p1 - p2)             [1]
+        # - log(p1)                     [1]
+        # - mean(p), std(p), max(p)     [3]
+        # - mean(log p), std(log p)     [2]
+        # Total (without ATP): 1 + 1 + 1 + 3 + 2 = 8
         base_feat_dim = 0
         if self.use_entropy: base_feat_dim += 1
-        if self.use_margin: base_feat_dim += 2
-        if self.use_top_stats: base_feat_dim += 5
-        if self.use_alt_entropy: base_feat_dim += 1
-        if self.use_binary_entropy_delta: base_feat_dim += 1
-        if self.use_raw_logp: base_feat_dim += self.raw_k
+        if self.use_margin: base_feat_dim += 2  # margin + log(p1)
+        if self.use_top_stats: base_feat_dim += 5  # mean, std, max, mean_log, std_log
 
         total_feat_dim = base_feat_dim + (atp_dim if self.use_atp else 0)
 
+        # Project token features to GRU input size
         gru_in_dim = int(getattr(args, "gru_input_dim", self.hidden_dim))
         self.feat_proj = nn.Sequential(
             nn.Linear(total_feat_dim, gru_in_dim),
@@ -398,6 +438,8 @@ class LOS_GRU(nn.Module):
         )
 
         out_dim = self.hidden_dim * (2 if self.bidirectional else 1)
+
+        # A small head (optionally with LayerNorm) to stabilize and reduce overfit
         self.head = nn.Sequential(
             nn.LayerNorm(out_dim),
             nn.Dropout(self.dropout),
@@ -406,97 +448,83 @@ class LOS_GRU(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def _token_features(self, sorted_TDS_normalized: torch.Tensor) -> torch.Tensor:
-        x = sorted_TDS_normalized.to(torch.float32)  # [B,N,V]
-        eps = 1e-8
-
-        # Build (logp, p) robustly
-        # Case 1: probabilities
-        if x.min().item() >= 0.0 and x.max().item() <= 1.0 + 1e-3:
-            p = x.clamp_min(eps)
-            logp = p.log()
-        # Case 2: log-probabilities (typically <= 0)
-        elif x.max().item() <= 0.0:
-            logp = x
-            p = logp.exp().clamp_min(eps)
-        # Case 3: logits
-        else:
-            logp = torch.log_softmax(x, dim=-1)
-            p = logp.exp().clamp_min(eps)
+        """
+        sorted_TDS_normalized: [B, N, V]
+        returns: [B, N, base_feat_dim]
+        """
+        p = sorted_TDS_normalized.to(torch.float32)
 
         feats = []
 
-        # Entropy over the (top-k) normalized distribution we formed
+        # dynamics (very HALT/EPR-aligned)
         if self.use_entropy:
-            feats.append(_safe_entropy(p, eps=eps))  # [B,N,1]
+            H = _safe_entropy(p)  # [B,N,1]
+            dH = _delta_feat(H)
+            feats.append(dH)
+            feats.append(_rolling_mean(dH, w=4))
+            feats.append(_rolling_var(dH, w=4))
 
-        # Margin + log(p1)
-        p1 = p[..., 0:1]
-        p2 = p[..., 1:2] if p.size(-1) > 1 else torch.zeros_like(p1)
         if self.use_margin:
-            feats.append(p1 - p2)
-            feats.append(_safe_log(p1, eps))  # log(p1) safe
+            p1 = p[..., 0:1]
+            p2 = p[..., 1:2] if p.size(-1) > 1 else torch.zeros_like(p1)
+            margin = (p1 - p2)
+            logp1 = _safe_log(p1)
 
-        # Summary stats (IMPORTANT: use the computed logp, don't overwrite it)
+            dlogp1 = _delta_feat(logp1)
+            dmargin = _delta_feat(margin)
+
+            feats.append(dlogp1)
+            feats.append(dmargin)
+
         if self.use_top_stats:
             mean_p = p.mean(dim=-1, keepdim=True)
-            std_p  = p.std(dim=-1, keepdim=True, unbiased=False)
-            max_p  = p.max(dim=-1, keepdim=True).values
+            std_p = p.std(dim=-1, keepdim=True, unbiased=False)
+            max_p = p.max(dim=-1, keepdim=True).values
 
+            logp = _safe_log(p)
             mean_logp = logp.mean(dim=-1, keepdim=True)
-            std_logp  = logp.std(dim=-1, keepdim=True, unbiased=False)
+            std_logp = logp.std(dim=-1, keepdim=True, unbiased=False)
 
             feats.extend([mean_p, std_p, max_p, mean_logp, std_logp])
 
-        # Alt-entropy over alternatives excluding top-1
-        if self.use_alt_entropy:
-            p_alt = p[..., 1:]
-            z = p_alt.sum(dim=-1, keepdim=True).clamp_min(eps)
-            p_alt = p_alt / z
-            alt_ent = -(p_alt.clamp_min(eps) * p_alt.clamp_min(eps).log()).sum(dim=-1, keepdim=True)
-            feats.append(alt_ent)
-
-        # Binary decision entropy delta (top1 vs top2)
-        if self.use_binary_entropy_delta:
-            s = (p1 + p2).clamp_min(eps)
-            q1 = (p1 / s).clamp_min(eps)
-            q2 = (p2 / s).clamp_min(eps)
-            h_bin = -(q1 * q1.log() + q2 * q2.log())  # [B,N,1]
-            dh = torch.zeros_like(h_bin)
-            dh[:, 1:] = h_bin[:, 1:] - h_bin[:, :-1]
-            feats.append(dh)
-
-        # Raw top-K log-probs (HALT-style): USE logp directly
-        if self.use_raw_logp:
-            k = min(self.raw_k, p.size(-1))
-            feats.append(logp[..., :k])  # [B,N,k]
-
         return torch.cat(feats, dim=-1)
 
-    def _topq_pool(self, h: torch.Tensor) -> torch.Tensor:
-        B, N, D = h.shape
-        q = self.topq if (0.0 < self.topq <= 1.0) else 0.2
-        k = max(1, int(math.ceil(q * N)))
-
-        scores = torch.norm(h, p=2, dim=-1)  # [B,N]
-        topk_idx = torch.topk(scores, k=k, dim=1, largest=True, sorted=False).indices  # [B,k]
-        idx = topk_idx.unsqueeze(-1).expand(-1, -1, D)  # [B,k,D]
-        gathered = torch.gather(h, dim=1, index=idx)    # [B,k,D]
-        return gathered.mean(dim=1)
-
     def _pool_seq(self, h: torch.Tensor) -> torch.Tensor:
-        return self._topq_pool(h)
+        """
+        h: [B, N, D]
+        returns: [B, D] pooled
+        """
+        if self.pool == "mean":
+            return h.mean(dim=1)
+        if self.pool == "max":
+            return h.max(dim=1).values
+        if self.pool == "cls":
+            # For GRU there is no CLS token; we interpret "cls" as last timestep.
+            return h[:, -1]
+        if self.pool == "mean_cls":
+            return 0.5 * (h.mean(dim=1) + h[:, -1])
+        if self.pool == "mean_max":
+            return 0.5 * (h.mean(dim=1) + h.max(dim=1).values)
+        # mean_max_cls
+        return (h.mean(dim=1) + h.max(dim=1).values + h[:, -1]) / 3.0
 
     def forward(self, sorted_TDS_normalized, normalized_ATP, ATP_R):
+        # Base distribution-derived token features
         base = self._token_features(sorted_TDS_normalized)  # [B,N,F]
 
+        # Optional ATP/rank features
         if self.use_atp:
-            atp = self.atp_encoder(normalized_ATP=normalized_ATP, ATP_R=ATP_R).to(torch.float32)
+            atp = self.atp_encoder(normalized_ATP=normalized_ATP, ATP_R=ATP_R).to(torch.float32)  # [B,N,atp_dim]
             feats = torch.cat([base, atp], dim=-1)
         else:
             feats = base
 
-        x = self.feat_proj(feats)
-        h, _ = self.gru(x)
-        pooled = self._pool_seq(h)
-        logits = self.head(pooled)
+        x = self.feat_proj(feats)  # [B,N,gru_in_dim]
+
+        # GRU
+        h, _ = self.gru(x)  # [B,N,out_dim]
+
+        pooled = self._pool_seq(h)  # [B,out_dim]
+        logits = self.head(pooled)  # [B,1]
+
         return self.sigmoid(logits).squeeze(-1)
