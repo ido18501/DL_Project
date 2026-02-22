@@ -275,9 +275,12 @@ class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
 
         # 2.1 Top-k probabilities
         p_top = sorted_TDS_normalized[:, :, :k].to(torch.float32)          # [B,N,k]
+        p_top = torch.clamp(p_top, min=0.0)
         p_tail = 1.0 - torch.sum(p_top, dim=-1, keepdim=True)              # [B,N,1]
         p_tail = torch.clamp(p_tail, min=0.0)                              # robust
-        logp_top = torch.log(p_top + self.eps)                             # [B,N,k]
+        logp_top = torch.log(p_top + self.eps)
+        logp_top = torch.nan_to_num(logp_top, nan=torch.log(torch.tensor(self.eps, device=logp_top.device)), posinf=0.0,
+                                    neginf=torch.log(torch.tensor(self.eps, device=logp_top.device)))
 
         # 2.2 Distribution-shape stats
         entropy_top = -torch.sum(p_top * logp_top, dim=-1, keepdim=True)   # [B,N,1]
@@ -333,7 +336,7 @@ class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
             d_entropy, d2_entropy, # [B,N,2]
             rank_emb               # [B,N,E]
         ], dim=-1)                 # [B,N,F]
-
+        feats = torch.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
         feats = self.feature_ln(feats)
         feats = self._apply_group_feature_mask(feats)
         feats = self.feature_drop(feats)
