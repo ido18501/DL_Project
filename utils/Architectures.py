@@ -808,105 +808,90 @@ class LOS_Net(nn.Module):
 # ---------------------------
 
 class LOS_GRU(nn.Module):
-    """
-    HALT-style time-series classifier for hallucination detection.
+    def __init__(self, args, max_sequence_length: int, input_dim: int = 1000):
+        super().__init__()
+        self.args = args
+        self.max_sequence_length = max_sequence_length
+        self.input_dim = input_dim
 
-    Key idea:
-    - Convert per-token top-k distribution into a small set of uncertainty/stat features.
-    - Concatenate with ATP-based features (normalized_ATP + rank encoding).
-    - Run a (bi)GRU over token time steps.
-    - Pool + classify.
+        # GRU capacity
+        self.hidden_dim = args.hidden_dim
+        self.dropout = args.dropout
+        self.num_layers = max(1, int(getattr(args, "num_layers", 1)))
+        self.bidirectional = bool(getattr(args, "bidirectional", True))
+        self.pool = _get_pool_type(args)
 
-    This is designed to:
-    - reduce overfitting (lower effective capacity, stronger inductive bias)
-    - converge with fewer epochs
-    """
+        # Feature switches (must match _token_features)
+        self.use_entropy = True
+        self.use_margin = True
+        self.use_top_stats = True
+        self.use_atp = True
 
-    class LOS_GRU(nn.Module):
-        def __init__(self, args, max_sequence_length: int, input_dim: int = 1000):
-            super().__init__()
-            self.args = args
-            self.max_sequence_length = max_sequence_length
-            self.input_dim = input_dim
+        # If you added dynamics features, keep this True
+        self.use_dynamics = True
+        self.roll_window = int(getattr(args, "roll_window", 4))
 
-            # GRU capacity
-            self.hidden_dim = args.hidden_dim
-            self.dropout = args.dropout
-            self.num_layers = max(1, int(getattr(args, "num_layers", 1)))
-            self.bidirectional = bool(getattr(args, "bidirectional", True))
-            self.pool = _get_pool_type(args)
+        # ATP encoder (keep small)
+        self.atp_dim = int(getattr(args, "atp_feature_dim", max(8, self.hidden_dim // 8)))
+        self.atp_encoder = RankATPEncoder(args=args, hidden_dim=self.atp_dim) if self.use_atp else None
 
-            # Feature switches (must match _token_features)
-            self.use_entropy = True
-            self.use_margin = True
-            self.use_top_stats = True
-            self.use_atp = True
+        # Compute feature dims EXACTLY (don’t hand count elsewhere)
+        base_feat_dim = self._base_feat_dim()
+        total_feat_dim = base_feat_dim + (self.atp_dim if self.use_atp else 0)
 
-            # If you added dynamics features, keep this True
-            self.use_dynamics = True
-            self.roll_window = int(getattr(args, "roll_window", 4))
+        # Project token features to GRU input size
+        self.gru_in_dim = int(getattr(args, "gru_input_dim", self.hidden_dim))
+        self.feat_proj = nn.Sequential(
+            nn.Linear(total_feat_dim, self.gru_in_dim),
+            nn.GELU(),
+            nn.Dropout(self.dropout),
+        )
 
-            # ATP encoder (keep small)
-            self.atp_dim = int(getattr(args, "atp_feature_dim", max(8, self.hidden_dim // 8)))
-            self.atp_encoder = RankATPEncoder(args=args, hidden_dim=self.atp_dim) if self.use_atp else None
+        self.gru = nn.GRU(
+            input_size=self.gru_in_dim,
+            hidden_size=self.hidden_dim,
+            num_layers=self.num_layers,
+            batch_first=True,
+            dropout=self.dropout if self.num_layers > 1 else 0.0,
+            bidirectional=self.bidirectional,
+        )
 
-            # Compute feature dims EXACTLY (don’t hand count elsewhere)
-            base_feat_dim = self._base_feat_dim()
-            total_feat_dim = base_feat_dim + (self.atp_dim if self.use_atp else 0)
+        self.out_dim = self.hidden_dim * (2 if self.bidirectional else 1)
 
-            # Project token features to GRU input size
-            self.gru_in_dim = int(getattr(args, "gru_input_dim", self.hidden_dim))
-            self.feat_proj = nn.Sequential(
-                nn.Linear(total_feat_dim, self.gru_in_dim),
-                nn.GELU(),
-                nn.Dropout(self.dropout),
-            )
+        self.head = nn.Sequential(
+            nn.LayerNorm(self.out_dim),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.out_dim, 1),
+        )
+        self.sigmoid = nn.Sigmoid()
 
-            self.gru = nn.GRU(
-                input_size=self.gru_in_dim,
-                hidden_size=self.hidden_dim,
-                num_layers=self.num_layers,
-                batch_first=True,
-                dropout=self.dropout if self.num_layers > 1 else 0.0,
-                bidirectional=self.bidirectional,
-            )
+        # Optional one-time debug to ensure dims match at runtime
+        self._debug_feat_dim_once = bool(getattr(args, "debug_feat_dim", False))
 
-            self.out_dim = self.hidden_dim * (2 if self.bidirectional else 1)
+    def _base_feat_dim(self) -> int:
+        """
+        MUST match exactly what _token_features() appends.
+        """
+        d = 0
 
-            self.head = nn.Sequential(
-                nn.LayerNorm(self.out_dim),
-                nn.Dropout(self.dropout),
-                nn.Linear(self.out_dim, 1),
-            )
-            self.sigmoid = nn.Sigmoid()
+        if self.use_entropy:
+            d += 1  # H
+            if self.use_dynamics:
+                d += 1  # dH
+                d += 1  # roll_mean(dH)
+                d += 1  # roll_var(dH)
 
-            # Optional one-time debug to ensure dims match at runtime
-            self._debug_feat_dim_once = bool(getattr(args, "debug_feat_dim", False))
+        if self.use_margin:
+            d += 1  # margin
+            d += 1  # log(p1)
+            if self.use_dynamics:
+                d += 1  # dlogp1
+                d += 1  # dmargin
 
-        def _base_feat_dim(self) -> int:
-            """
-            MUST match exactly what _token_features() appends.
-            """
-            d = 0
+        if self.use_top_stats:
+            d += 5  # mean_p, std_p, max_p, mean_logp, std_logp
 
-            if self.use_entropy:
-                d += 1  # H
-                if self.use_dynamics:
-                    d += 1  # dH
-                    d += 1  # roll_mean(dH)
-                    d += 1  # roll_var(dH)
-
-            if self.use_margin:
-                d += 1  # margin
-                d += 1  # log(p1)
-                if self.use_dynamics:
-                    d += 1  # dlogp1
-                    d += 1  # dmargin
-
-            if self.use_top_stats:
-                d += 5  # mean_p, std_p, max_p, mean_logp, std_logp
-
-            return d
+        return d
     def _token_features(self, sorted_TDS_normalized: torch.Tensor) -> torch.Tensor:
         """
         sorted_TDS_normalized: [B, N, V]
