@@ -355,16 +355,11 @@ class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
             pooled = self.attn_pool(h)              # [B,D]
 
         # 4.2 Sequence head
-        logits = self.seq_head(pooled)              # [B,1]
-        seq_prob = self.sigmoid(logits).squeeze(-1) # [B]
-
-        # 4.3 Optional token head (OFF by default)
+        logits = self.seq_head(pooled)  # [B,1]
         if self.return_token_scores:
-            token_logits = self.token_head(h)       # [B,N,1]
-            token_prob = self.sigmoid(token_logits)
-            return seq_prob, token_prob
-
-        return seq_prob
+            token_logits = self.token_head(h)  # [B,N,1]
+            return logits.squeeze(-1), token_logits
+        return logits.squeeze(-1)
 
 
 # -----------------------------

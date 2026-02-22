@@ -33,11 +33,11 @@ MODEL_VOCAB_SIZES = {
 }
 
 PROBE_MODELS = [
-    ## logit-based
     'LOS-Net',
     'ATP_R_MLP',
     'ATP_R_Transf',
-    ]
+    'LOS++',
+]
 
 MAXIMAL_VOCAB_SIZE = 1_000_000
 

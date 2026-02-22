@@ -254,9 +254,9 @@ def main():
     args = parse_args_main()
     logger.info("Starting the data processing pipeline.")
     logger.info(f"Parsed Arguments: {vars(args)}")
-    
+
     if args.input_type == 'LOS':
-        assert args.probe_model in ["LOS-Net", "LOS_GRU", "ATP_R_MLP", "ATP_R_Transf"]
+        assert args.probe_model in ["LOS-Net", "ATP_R_MLP", "ATP_R_Transf", "LOS++"]
     else:
         raise ValueError("Invalid input type.")
     
