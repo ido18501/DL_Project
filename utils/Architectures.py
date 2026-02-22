@@ -54,6 +54,29 @@ def _rolling_var(x: torch.Tensor, w: int = 4) -> torch.Tensor:
     m2 = _rolling_mean(x * x, w)
     return (m2 - m * m).clamp_min(0.0)
 
+def _base_feat_dim(self) -> int:
+    d = 0
+    if self.use_entropy:
+        d += 1  # H
+
+        # if you added these:
+        d += 1  # dH
+        d += 1  # roll_mean(dH)
+        d += 1  # roll_var(dH)
+
+    if self.use_margin:
+        d += 1  # margin
+        d += 1  # log(p1)
+
+        # if you added these:
+        d += 1  # dlogp1
+        d += 1  # dmargin
+
+    if self.use_top_stats:
+        d += 5  # mean_p, std_p, max_p, mean_logp, std_logp
+
+    return d
+
 def get_model(args, max_sequence_length, actual_sequence_length, input_dim, input_shape):
     """
     Args:
@@ -406,18 +429,7 @@ class LOS_GRU(nn.Module):
         self.atp_encoder = RankATPEncoder(args=args, hidden_dim=atp_dim) if self.use_atp else None
 
         # Build per-token feature dimension from top-k distribution
-        # Features (all per token):
-        # - entropy(topk)               [1]
-        # - margin(p1 - p2)             [1]
-        # - log(p1)                     [1]
-        # - mean(p), std(p), max(p)     [3]
-        # - mean(log p), std(log p)     [2]
-        # Total (without ATP): 1 + 1 + 1 + 3 + 2 = 8
-        base_feat_dim = 0
-        if self.use_entropy: base_feat_dim += 1
-        if self.use_margin: base_feat_dim += 2  # margin + log(p1)
-        if self.use_top_stats: base_feat_dim += 5  # mean, std, max, mean_log, std_log
-
+        base_feat_dim = self._base_feat_dim()
         total_feat_dim = base_feat_dim + (atp_dim if self.use_atp else 0)
 
         # Project token features to GRU input size
