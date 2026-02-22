@@ -1,992 +1,421 @@
-"""
-architectures.py — clean rewrite
-
-This module preserves the ORIGINAL public API contract expected by the training code:
-
-- get_model(args, max_sequence_length, actual_sequence_length, input_dim, input_shape)
-- model.forward(sorted_TDS_normalized, normalized_ATP, ATP_R) -> Tensor[B] with sigmoid probs
-
-It also adds a new low-capacity, strongly-regularized time-series model (HALT-style GRU)
-that is designed to generalize better and converge with fewer epochs.
-
-Notes:
-- Keeps existing model names ('LOS-Net', 'ATP_R_MLP', 'ATP_R_Transf') for compatibility.
-- Adds new probe option: 'LOS_GRU'  (HALT-style).
-"""
-
-from __future__ import annotations
-
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from einops import repeat
 from utils.constants import MODEL_VOCAB_SIZES
+from einops import repeat
 
-
-# ---------------------------
-# Public factory (API contract)
-# ---------------------------
-
-def _delta_feat(x: torch.Tensor) -> torch.Tensor:
-    # x: [B,N,1] -> [B,N,1], with x[:,0]=0
-    dx = x[:, 1:] - x[:, :-1]
-    zero = torch.zeros_like(x[:, :1])
-    return torch.cat([zero, dx], dim=1)
-
-def _rolling_mean(x: torch.Tensor, w: int = 4) -> torch.Tensor:
-    # causal rolling mean, SAME length as x
-    # x: [B,N,1] -> [B,N,1]
-    if w <= 1:
-        return x
-    xt = x.transpose(1, 2)                 # [B,1,N]
-    xt = F.pad(xt, (w - 1, 0))             # left pad only -> [B,1,N+w-1]
-    out = F.avg_pool1d(xt, kernel_size=w, stride=1)  # -> [B,1,N]
-    return out.transpose(1, 2)             # [B,N,1]
-
-def _rolling_var(x: torch.Tensor, w: int = 4) -> torch.Tensor:
-    # causal rolling variance, SAME length as x
-    if w <= 1:
-        return torch.zeros_like(x)
-    m = _rolling_mean(x, w)
-    m2 = _rolling_mean(x * x, w)
-    return (m2 - m * m).clamp_min(0.0)
-
-
-def get_model(args, max_sequence_length, actual_sequence_length, input_dim, input_shape):
-    """
-    Args:
-        args: argparse-like namespace. Must contain at least:
-              - probe_model
-              - hidden_dim, dropout, num_layers, heads (for transformer models)
-              - pool (optional; defaults handled)
-              - rank_encoding in {'scale_encoding','one_hot_encoding'}
-              - LLM string key for MODEL_VOCAB_SIZES
-        max_sequence_length: int, N_max used for position embeddings / padding.
-        actual_sequence_length: int, used by ATP_R_MLP (flattened).
-        input_dim: int, last-dim of sorted_TDS_normalized (topk), typically 1000.
-        input_shape: unused but kept for compatibility.
-    """
-    model_mapping = {
-        # Baseline-compatible
-        "LOS-Net": LOS_Net,
-        "ATP_R_MLP": ATP_R_MLP,
-        "ATP_R_Transf": ATP_R_Transf,
-
-        # New: HALT-style time-series head
-        "LOS_GRU": LOS_GRU,
-    }
-
-    if args.probe_model not in model_mapping:
-        raise ValueError(f"Unknown model: {args.probe_model}")
-
-    if args.probe_model in {"ATP_R_MLP"}:
-        return model_mapping[args.probe_model](args=args, actual_sequence_length=actual_sequence_length)
-
-    # Sequence models
-    return model_mapping[args.probe_model](args=args, max_sequence_length=max_sequence_length, input_dim=input_dim)
-
-
-# ---------------------------
+# -----------------------------
 # Helpers
-# ---------------------------
+# -----------------------------
+def _get_attr(obj, name, default):
+    return getattr(obj, name, default)
 
-def _get_pool_type(args) -> str:
-    pool = getattr(args, "pool", "cls")
-    # keep backward compatibility and allow extra pool types used in your repo
-    allowed = {"cls", "mean", "max", "mean_cls", "mean_max", "mean_max_cls"}
-    if pool not in allowed:
-        # fall back safely
-        pool = "mean_max_cls"
-    return pool
-
-
-def _safe_entropy(p: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+def _delta_leftpad(x: torch.Tensor) -> torch.Tensor:
     """
-    p: [B, N, V] probabilities (not necessarily summing to 1 over V, but usually do for top-k normalized)
-    returns: [B, N, 1]
+    delta(x) = concat(zeros_like(x[:,:1]), x[:,1:] - x[:,:-1], dim=1)
+    Works for x shape [B, N, C]
     """
-    p = p.clamp_min(eps)
-    return -(p * p.log()).sum(dim=-1, keepdim=True)
+    z = torch.zeros_like(x[:, :1])
+    return torch.cat([z, x[:, 1:] - x[:, :-1]], dim=1)
 
-
-def _safe_log(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    return (x.clamp_min(eps)).log()
-
-
-# ---------------------------
-# Rank/ATP encodings (shared)
-# ---------------------------
-
-class RankATPEncoder(nn.Module):
-    """
-    Encodes (normalized_ATP, ATP_R) into a hidden vector per token.
-
-    - normalized_ATP: [B, N, 1] float
-    - ATP_R: [B, N] int (token rank/index)
-
-    Output: [B, N, D]
-    """
-    def __init__(self, args, hidden_dim: int):
+# -----------------------------
+# Depthwise-separable Conv block
+# -----------------------------
+class DepthwiseSeparableConv1DBlock(nn.Module):
+    def __init__(self, d_model: int, kernel_size: int, dropout: float):
         super().__init__()
-        self.args = args
-        self.hidden_dim = hidden_dim
+        self.dw = nn.Conv1d(
+            in_channels=d_model,
+            out_channels=d_model,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=d_model,
+            bias=False,
+        )
+        self.pw = nn.Conv1d(
+            in_channels=d_model,
+            out_channels=d_model,
+            kernel_size=1,
+            bias=True,
+        )
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
 
-        # normalized_ATP modulation parameter
-        self.param_for_normalized_ATP = nn.Parameter(torch.randn(1, 1, hidden_dim))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, N, D]
+        residual = x
+        y = x.transpose(1, 2)        # [B, D, N]
+        y = self.dw(y)
+        y = self.pw(y)
+        y = y.transpose(1, 2)        # [B, N, D]
+        y = self.act(y)
+        y = self.drop(y)
+        return residual + y
 
-        rank_encoding = getattr(args, "rank_encoding", "scale_encoding")
-        self.rank_encoding = rank_encoding
-
-        if rank_encoding == "scale_encoding":
-            self.param_for_ATP_R = nn.Parameter(torch.randn(1, 1, hidden_dim))
-        elif rank_encoding == "one_hot_encoding":
-            vocab_size = MODEL_VOCAB_SIZES[self.args.LLM]
-            self.one_hot_embedding = nn.Embedding(vocab_size, hidden_dim)
-        else:
-            raise ValueError("Invalid rank_encoding. Choose 'scale_encoding' or 'one_hot_encoding'.")
-
-    def compute_encoded_ATP_R(self, normalized_ATP: torch.Tensor, ATP_R: torch.Tensor) -> torch.Tensor:
-        """
-        Scale encoding from the original file:
-        encoded_ATP_R = 2 * (0.5 - (ATP_R / vocab_size))
-        return normalized_ATP * encoded_ATP_R.unsqueeze(-1) * param_for_ATP_R
-        """
-        vocab_size = MODEL_VOCAB_SIZES[self.args.LLM]
-        encoded_ATP_R = 2.0 * (0.5 - (ATP_R.to(torch.float32) / float(vocab_size)))
-        return normalized_ATP * encoded_ATP_R.unsqueeze(-1) * self.param_for_ATP_R
-
-    def forward(self, normalized_ATP: torch.Tensor, ATP_R: torch.Tensor) -> torch.Tensor:
-        if self.rank_encoding == "scale_encoding":
-            encoded_ATP_R = self.compute_encoded_ATP_R(normalized_ATP=normalized_ATP, ATP_R=ATP_R)
-        else:
-            encoded_ATP_R = normalized_ATP * self.one_hot_embedding(ATP_R)
-
-        encoded_normalized_ATP = normalized_ATP * self.param_for_normalized_ATP
-        return encoded_ATP_R + encoded_normalized_ATP
-
-
-# ---------------------------
-# Models (baseline-compatible)
-# ---------------------------
-
-class ATP_R_MLP(nn.Module):
-    """
-    Baseline-compatible MLP using only (normalized_ATP, ATP_R), flattened over sequence.
-
-    forward(sorted_TDS_normalized, normalized_ATP, ATP_R) -> [B]
-    """
-    def __init__(self, args, actual_sequence_length: int):
+# -----------------------------
+# Attention pooling
+# -----------------------------
+class AttnPooling(nn.Module):
+    def __init__(self, d_model: int, dropout: float):
         super().__init__()
-        self.args = args
-        self.hidden_dim = args.hidden_dim
-        self.dropout = args.dropout
-        self.num_layers = args.num_layers
-        self.actual_sequence_length = actual_sequence_length
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, 1),
+        )
 
-        self.encoder = RankATPEncoder(args=args, hidden_dim=self.hidden_dim)
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        # h: [B, N, D]
+        scores = self.mlp(h)                 # [B, N, 1]
+        w = torch.softmax(scores, dim=1)     # [B, N, 1]
+        pooled = torch.sum(w * h, dim=1)     # [B, D]
+        return pooled
 
-        self.lin_layers = nn.ModuleList()
-        self.batch_norms = nn.ModuleList()
-
-        for i in range(self.num_layers):
-            in_dim = self.hidden_dim * self.actual_sequence_length if i == 0 else self.hidden_dim
-            out_dim = 1 if (i + 1) == self.num_layers else self.hidden_dim
-            self.lin_layers.append(nn.Linear(in_dim, out_dim))
-            if (i + 1) < self.num_layers:
-                self.batch_norms.append(nn.BatchNorm1d(out_dim))
-
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, sorted_TDS_normalized, normalized_ATP, ATP_R):
-        x = self.encoder(normalized_ATP=normalized_ATP, ATP_R=ATP_R)  # [B,N,D]
-        x = x.flatten(start_dim=1)  # [B, N*D]
-
-        for i, lin in enumerate(self.lin_layers):
-            x = lin(x)
-            if (i + 1) < self.num_layers:
-                x = self.batch_norms[i](x)
-                x = F.relu(x)
-                x = F.dropout(x, p=self.dropout, training=self.training)
-
-        return self.sigmoid(x).squeeze(-1)
-
-
-class ATP_R_Transf(nn.Module):
+# -----------------------------
+# LOS++ Candidate 1
+# -----------------------------
+class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
     """
-    Baseline-compatible Transformer using only (normalized_ATP, ATP_R).
+    Candidate 1: "LOS++ Multi-Scale Delta Transformer"
 
-    forward(sorted_TDS_normalized, normalized_ATP, ATP_R) -> [B]
+    Forward signature MUST match existing code:
+        forward(sorted_TDS_normalized, normalized_ATP, ATP_R) -> [B]
     """
-    def __init__(self, args, max_sequence_length: int, input_dim: int = 1):
+
+    def __init__(self, args, max_sequence_length, input_dim=1):
         super().__init__()
         self.args = args
         self.max_sequence_length = max_sequence_length
-        self.hidden_dim = args.hidden_dim
-        self.heads = args.heads
-        self.dropout = args.dropout
-        self.num_layers = args.num_layers
-        self.pool = _get_pool_type(args)
 
-        self.encoder = RankATPEncoder(args=args, hidden_dim=self.hidden_dim)
+        # Defaults (overrideable by args if present)
+        self.k = _get_attr(args, "k", 20)
+        self.rank_emb_dim = _get_attr(args, "rank_emb_dim", 16)
+        self.d_model = _get_attr(args, "hidden_dim", 128)  # keep style similar to repo
+        self.dropout = _get_attr(args, "dropout", 0.1)
+        self.conv_blocks = _get_attr(args, "conv_blocks", 3)
+        self.transformer_layers = _get_attr(args, "transformer_layers", 2)
+        self.heads = _get_attr(args, "heads", 4)
+        self.pooling = _get_attr(args, "pooling", None)
 
-        self.cls_token = nn.Parameter(torch.randn(1, 1, self.hidden_dim))
-        self.pos_embedding = nn.Embedding(self.max_sequence_length + 1, self.hidden_dim)
+        # Backwards-compat w/ existing args.pool ("cls"/"mean")
+        # We don't use CLS token here; treat anything not "mean" as "attn".
+        if self.pooling is None:
+            pool_arg = _get_attr(args, "pool", "attn")
+            self.pooling = "mean" if pool_arg == "mean" else "attn"
+        assert self.pooling in {"mean", "attn"}
 
-        self.attention_layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=self.hidden_dim,
-                nhead=self.heads,
-                dropout=self.dropout,
-                dim_feedforward=self.hidden_dim * 4,
-                batch_first=True,
-                activation="gelu",
-                norm_first=True,
-            )
-            for _ in range(self.num_layers)
-        ])
+        assert self.d_model % self.heads == 0, "d_model must be divisible by nhead"
 
-        self.mlp_head = nn.Linear(self.hidden_dim, 1)
-        self.sigmoid = nn.Sigmoid()
+        self.eps = 1e-9
 
-    def _pool(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, N+1, D]
-        if self.pool == "cls":
-            return x[:, 0]
-        if self.pool == "mean":
-            return x.mean(dim=1)
-        if self.pool == "max":
-            return x.max(dim=1).values
-        if self.pool == "mean_cls":
-            return 0.5 * (x.mean(dim=1) + x[:, 0])
-        if self.pool == "mean_max":
-            return 0.5 * (x.mean(dim=1) + x.max(dim=1).values)
-        # mean_max_cls
-        return (x.mean(dim=1) + x.max(dim=1).values + x[:, 0]) / 3.0
+        # Rank buckets: [1,2,3,4,5,10,20,50,100,200,500,1000, inf]
+        # We'll implement via thresholds (excluding inf), and clamp to last bucket.
+        self.register_buffer(
+            "rank_bucket_thresholds",
+            torch.tensor([1, 2, 3, 4, 5, 10, 20, 50, 100, 200, 500, 1000], dtype=torch.long),
+            persistent=False,
+        )
+        self.rank_bucket_emb = nn.Embedding(
+            num_embeddings=len(self.rank_bucket_thresholds) + 1,  # +1 for >1000
+            embedding_dim=self.rank_emb_dim,
+        )
 
-    def forward(self, sorted_TDS_normalized, normalized_ATP, ATP_R):
-        x = self.encoder(normalized_ATP=normalized_ATP, ATP_R=ATP_R).to(torch.float32)  # [B,N,D]
-        b, n, _ = x.shape
+        # Feature normalization + dropout
+        # F dimension depends on k and rank_emb_dim:
+        # logp_top(k) + entropy(1) + margin(1) + log_gap(1) + p_tail(1)
+        # + cdf2/cdf5/cdf10/cdf20 (4)
+        # + normalized_ATP(1) + d_atp(1) + d2_atp(1)
+        # + rank(1) + d_rank(1)
+        # + d_entropy(1) + d2_entropy(1)
+        # + rank_emb(rank_emb_dim)
+        self.F = (
+            self.k + 1 + 1 + 1 + 1 +
+            4 +
+            1 + 1 + 1 +
+            1 + 1 +
+            1 + 1 +
+            self.rank_emb_dim
+        )
 
-        cls = repeat(self.cls_token, "1 1 d -> b 1 d", b=b)
-        x = torch.cat([cls, x], dim=1)  # [B,N+1,D]
+        self.feature_ln = nn.LayerNorm(self.F)
+        self.feature_drop = nn.Dropout(self.dropout)
 
-        pos_idx = torch.arange(n + 1, device=x.device).unsqueeze(0)
-        x = x + self.pos_embedding(pos_idx)
+        # Optional stochastic feature masking (training only)
+        self.feature_masking = _get_attr(args, "feature_masking", False)
+        self.feature_mask_p = _get_attr(args, "feature_mask_p", 0.1)
 
-        for layer in self.attention_layers:
-            x = layer(x)
-
-        x = self._pool(x)
-        x = self.mlp_head(x)
-        return self.sigmoid(x).squeeze(-1)
-
-
-class LOS_Net(nn.Module):
-    """
-    Baseline-compatible LOS-Net:
-    - Uses sorted_TDS_normalized projected to D/2
-    - Concatenates with ATP features projected to D/2
-    - Transformer over tokens (+ CLS)
-    """
-    def __init__(self, args, max_sequence_length: int, input_dim: int = 1):
-        super().__init__()
-        self.args = args
-        self.max_sequence_length = max_sequence_length
-        self.input_dim = input_dim
-        self.hidden_dim = args.hidden_dim
-        self.heads = args.heads
-        self.dropout = args.dropout
-        self.num_layers = args.num_layers
-        self.pool = _get_pool_type(args)
-
-        assert self.hidden_dim % 2 == 0, "hidden_dim must be even for LOS_Net (split into two halves)."
-
-        # ATP encoder produces D/2
-        self.atp_encoder = RankATPEncoder(args=args, hidden_dim=self.hidden_dim // 2)
-
-        # Project top-k probs/logits to D/2
-        self.input_proj = nn.Linear(input_dim, self.hidden_dim // 2)
-
-        # Tokens are concatenated to D
-        self.cls_token = nn.Parameter(torch.randn(1, 1, self.hidden_dim))
-        self.pos_embedding = nn.Embedding(self.max_sequence_length + 1, self.hidden_dim)
-
-        self.attention_layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=self.hidden_dim,
-                nhead=self.heads,
-                dropout=self.dropout,
-                dim_feedforward=self.hidden_dim * 4,
-                batch_first=True,
-                activation="gelu",
-                norm_first=True,
-            )
-            for _ in range(self.num_layers)
-        ])
-
-        self.mlp_head = nn.Linear(self.hidden_dim, 1)
-        self.sigmoid = nn.Sigmoid()
-
-    def _pool(self, x: torch.Tensor) -> torch.Tensor:
-        if self.pool == "cls":
-            return x[:, 0]
-        if self.pool == "mean":
-            return x.mean(dim=1)
-        if self.pool == "max":
-            return x.max(dim=1).values
-        if self.pool == "mean_cls":
-            return 0.5 * (x.mean(dim=1) + x[:, 0])
-        if self.pool == "mean_max":
-            return 0.5 * (x.mean(dim=1) + x.max(dim=1).values)
-        return (x.mean(dim=1) + x.max(dim=1).values + x[:, 0]) / 3.0  # mean_max_cls
-
-    def forward(self, sorted_TDS_normalized, normalized_ATP, ATP_R):
-        # sorted_TDS_normalized: [B,N,V] (V ~ 1000), float
-        tds = self.input_proj(sorted_TDS_normalized.to(torch.float32))  # [B,N,D/2]
-        atp = self.atp_encoder(normalized_ATP=normalized_ATP, ATP_R=ATP_R).to(torch.float32)  # [B,N,D/2]
-        x = torch.cat([tds, atp], dim=-1)  # [B,N,D]
-
-        b, n, _ = x.shape
-        cls = repeat(self.cls_token, "1 1 d -> b 1 d", b=b)
-        x = torch.cat([cls, x], dim=1)  # [B,N+1,D]
-
-        pos_idx = torch.arange(n + 1, device=x.device).unsqueeze(0)
-        x = x + self.pos_embedding(pos_idx)
-
-        for layer in self.attention_layers:
-            x = layer(x)
-
-        x = self._pool(x)
-        x = self.mlp_head(x)
-        return self.sigmoid(x).squeeze(-1)
-
-
-# ---------------------------
-# New: LOS_GRU (HALT-style)
-# ---------------------------
-
-class LOS_GRU(nn.Module):
-    """
-    HALT-style time-series classifier for hallucination detection.
-
-    Key idea:
-    - Convert per-token top-k distribution into a small set of uncertainty/stat features.
-    - Concatenate with ATP-based features (normalized_ATP + rank encoding).
-    - Run a (bi)GRU over token time steps.
-    - Pool + classify.
-
-    This is designed to:
-    - reduce overfitting (lower effective capacity, stronger inductive bias)
-    - converge with fewer epochs
-    """
-    def __init__(self, args, max_sequence_length: int, input_dim: int = 1000):
-        super().__init__()
-        self.args = args
-        self.max_sequence_length = max_sequence_length
-        self.input_dim = input_dim
-
-        # We use hidden_dim as GRU hidden size (keep it small in sweeps: 64/96/128)
-        self.hidden_dim = args.hidden_dim
-        self.dropout = args.dropout
-        self.num_layers = max(1, int(getattr(args, "num_layers", 1)))
-        self.bidirectional = bool(getattr(args, "bidirectional", True))
-        self.pool = _get_pool_type(args)
-
-        # Feature settings
-        self.use_entropy = True
-        self.use_margin = True
-        self.use_top_stats = True
-        self.use_atp = True
-
-        # ATP encoder -> small vector
-        # We keep ATP encoding width modest to avoid overfitting.
-        atp_dim = int(getattr(args, "atp_feature_dim", max(8, self.hidden_dim // 8)))
-        self.atp_encoder = RankATPEncoder(args=args, hidden_dim=atp_dim) if self.use_atp else None
-
-        # Build per-token feature dimension from top-k distribution
-        # Features (all per token):
-        # - entropy(topk)               [1]
-        # - margin(p1 - p2)             [1]
-        # - log(p1)                     [1]
-        # - mean(p), std(p), max(p)     [3]
-        # - mean(log p), std(log p)     [2]
-        # Total (without ATP): 1 + 1 + 1 + 3 + 2 = 8
-        base_feat_dim = 0
-        if self.use_entropy: base_feat_dim += 1
-        if self.use_margin: base_feat_dim += 2  # margin + log(p1)
-        if self.use_top_stats: base_feat_dim += 5  # mean, std, max, mean_log, std_log
-
-        total_feat_dim = base_feat_dim + (atp_dim if self.use_atp else 0)
-
-        # Project token features to GRU input size
-        gru_in_dim = int(getattr(args, "gru_input_dim", self.hidden_dim))
-        self.feat_proj = nn.Sequential(
-            nn.Linear(total_feat_dim, gru_in_dim),
+        # Token projection: F -> d_model
+        self.token_proj = nn.Sequential(
+            nn.Linear(self.F, self.d_model),
+            nn.LayerNorm(self.d_model),
             nn.GELU(),
             nn.Dropout(self.dropout),
         )
 
-        self.gru = nn.GRU(
-            input_size=gru_in_dim,
-            hidden_size=self.hidden_dim,
-            num_layers=self.num_layers,
+        # Local conv branch (multi-scale kernels cycling)
+        kernels = _get_attr(args, "conv_kernels", [3, 5, 7])
+        if not isinstance(kernels, (list, tuple)) or len(kernels) == 0:
+            kernels = [3, 5, 7]
+        self.conv_blocks_list = nn.ModuleList([
+            DepthwiseSeparableConv1DBlock(
+                d_model=self.d_model,
+                kernel_size=int(kernels[i % len(kernels)]),
+                dropout=self.dropout
+            )
+            for i in range(self.conv_blocks)
+        ])
+
+        # Global transformer branch
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=self.heads,
+            dim_feedforward=self.d_model * 2,
+            dropout=self.dropout,
             batch_first=True,
-            dropout=self.dropout if self.num_layers > 1 else 0.0,
-            bidirectional=self.bidirectional,
+            activation="gelu",
         )
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=self.transformer_layers)
 
-        out_dim = self.hidden_dim * (2 if self.bidirectional else 1)
+        # Pooling
+        self.attn_pool = AttnPooling(self.d_model, self.dropout)
 
-        # A small head (optionally with LayerNorm) to stabilize and reduce overfit
-        self.head = nn.Sequential(
-            nn.LayerNorm(out_dim),
-            nn.Dropout(self.dropout),
-            nn.Linear(out_dim, 1),
-        )
-        self.sigmoid = nn.Sigmoid()
-
-    def _token_features(self, sorted_TDS_normalized: torch.Tensor) -> torch.Tensor:
-        """
-        sorted_TDS_normalized: [B, N, V]
-        returns: [B, N, base_feat_dim]
-        """
-        p = sorted_TDS_normalized.to(torch.float32)
-
-        feats = []
-
-        if self.use_entropy:
-            feats.append(_safe_entropy(p))  # [B,N,1]
-
-        if self.use_margin:
-            # assume sorted descending => p[...,0] >= p[...,1]
-            p1 = p[..., 0:1]
-            p2 = p[..., 1:2] if p.size(-1) > 1 else torch.zeros_like(p1)
-            feats.append(p1 - p2)           # margin [B,N,1]
-            feats.append(_safe_log(p1))     # log(p1) [B,N,1]
-
-        if self.use_top_stats:
-            mean_p = p.mean(dim=-1, keepdim=True)
-            std_p = p.std(dim=-1, keepdim=True, unbiased=False)
-            max_p = p.max(dim=-1, keepdim=True).values
-
-            logp = _safe_log(p)
-            mean_logp = logp.mean(dim=-1, keepdim=True)
-            std_logp = logp.std(dim=-1, keepdim=True, unbiased=False)
-
-            feats.extend([mean_p, std_p, max_p, mean_logp, std_logp])
-
-        return torch.cat(feats, dim=-1)
-
-    def _pool_seq(self, h: torch.Tensor) -> torch.Tensor:
-        """
-        h: [B, N, D]
-        returns: [B, D] pooled
-        """
-        if self.pool == "mean":
-            return h.mean(dim=1)
-        if self.pool == "max":
-            return h.max(dim=1).values
-        if self.pool == "cls":
-            # For GRU there is no CLS token; we interpret "cls" as last timestep.
-            return h[:, -1]
-        if self.pool == "mean_cls":
-            return 0.5 * (h.mean(dim=1) + h[:, -1])
-        if self.pool == "mean_max":
-            return 0.5 * (h.mean(dim=1) + h.max(dim=1).values)
-        # mean_max_cls
-        return (h.mean(dim=1) + h.max(dim=1).values + h[:, -1]) / 3.0
-
-    def forward(self, sorted_TDS_normalized, normalized_ATP, ATP_R):
-        # Base distribution-derived token features
-        base = self._token_features(sorted_TDS_normalized)  # [B,N,F]
-
-        # Optional ATP/rank features
-        if self.use_atp:
-            atp = self.atp_encoder(normalized_ATP=normalized_ATP, ATP_R=ATP_R).to(torch.float32)  # [B,N,atp_dim]
-            feats = torch.cat([base, atp], dim=-1)
-        else:
-            feats = base
-
-        x = self.feat_proj(feats)  # [B,N,gru_in_dim]
-
-        # GRU
-        h, _ = self.gru(x)  # [B,N,out_dim]
-
-        pooled = self._pool_seq(h)  # [B,out_dim]
-        logits = self.head(pooled)  # [B,1]
-
-        return self.sigmoid(logits).squeeze(-1)
-
-def get_model(args, max_sequence_length, actual_sequence_length, input_dim, input_shape):
-    """
-    Args:
-        args: argparse-like namespace. Must contain at least:
-              - probe_model
-              - hidden_dim, dropout, num_layers, heads (for transformer models)
-              - pool (optional; defaults handled)
-              - rank_encoding in {'scale_encoding','one_hot_encoding'}
-              - LLM string key for MODEL_VOCAB_SIZES
-        max_sequence_length: int, N_max used for position embeddings / padding.
-        actual_sequence_length: int, used by ATP_R_MLP (flattened).
-        input_dim: int, last-dim of sorted_TDS_normalized (topk), typically 1000.
-        input_shape: unused but kept for compatibility.
-    """
-    model_mapping = {
-        # Baseline-compatible
-        "LOS-Net": LOS_Net,
-        "ATP_R_MLP": ATP_R_MLP,
-        "ATP_R_Transf": ATP_R_Transf,
-
-        # New: HALT-style time-series head
-        "LOS_GRU": LOS_GRU,
-    }
-
-    if args.probe_model not in model_mapping:
-        raise ValueError(f"Unknown model: {args.probe_model}")
-
-    if args.probe_model in {"ATP_R_MLP"}:
-        return model_mapping[args.probe_model](args=args, actual_sequence_length=actual_sequence_length)
-
-    # Sequence models
-    return model_mapping[args.probe_model](args=args, max_sequence_length=max_sequence_length, input_dim=input_dim)
-
-
-# ---------------------------
-# Helpers
-# ---------------------------
-
-def _get_pool_type(args) -> str:
-    pool = getattr(args, "pool", "cls")
-    # keep backward compatibility and allow extra pool types used in your repo
-    allowed = {"cls", "mean", "max", "mean_cls", "mean_max", "mean_max_cls"}
-    if pool not in allowed:
-        # fall back safely
-        pool = "mean_max_cls"
-    return pool
-
-
-def _safe_entropy(p: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """
-    p: [B, N, V] probabilities (not necessarily summing to 1 over V, but usually do for top-k normalized)
-    returns: [B, N, 1]
-    """
-    p = p.clamp_min(eps)
-    return -(p * p.log()).sum(dim=-1, keepdim=True)
-
-
-def _safe_log(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    return (x.clamp_min(eps)).log()
-
-
-# ---------------------------
-# Rank/ATP encodings (shared)
-# ---------------------------
-
-class RankATPEncoder(nn.Module):
-    """
-    Encodes (normalized_ATP, ATP_R) into a hidden vector per token.
-
-    - normalized_ATP: [B, N, 1] float
-    - ATP_R: [B, N] int (token rank/index)
-
-    Output: [B, N, D]
-    """
-    def __init__(self, args, hidden_dim: int):
-        super().__init__()
-        self.args = args
-        self.hidden_dim = hidden_dim
-
-        # normalized_ATP modulation parameter
-        self.param_for_normalized_ATP = nn.Parameter(torch.randn(1, 1, hidden_dim))
-
-        rank_encoding = getattr(args, "rank_encoding", "scale_encoding")
-        self.rank_encoding = rank_encoding
-
-        if rank_encoding == "scale_encoding":
-            self.param_for_ATP_R = nn.Parameter(torch.randn(1, 1, hidden_dim))
-        elif rank_encoding == "one_hot_encoding":
-            vocab_size = MODEL_VOCAB_SIZES[self.args.LLM]
-            self.one_hot_embedding = nn.Embedding(vocab_size, hidden_dim)
-        else:
-            raise ValueError("Invalid rank_encoding. Choose 'scale_encoding' or 'one_hot_encoding'.")
-
-    def compute_encoded_ATP_R(self, normalized_ATP: torch.Tensor, ATP_R: torch.Tensor) -> torch.Tensor:
-        """
-        Scale encoding from the original file:
-        encoded_ATP_R = 2 * (0.5 - (ATP_R / vocab_size))
-        return normalized_ATP * encoded_ATP_R.unsqueeze(-1) * param_for_ATP_R
-        """
-        vocab_size = MODEL_VOCAB_SIZES[self.args.LLM]
-        encoded_ATP_R = 2.0 * (0.5 - (ATP_R.to(torch.float32) / float(vocab_size)))
-        return normalized_ATP * encoded_ATP_R.unsqueeze(-1) * self.param_for_ATP_R
-
-    def forward(self, normalized_ATP: torch.Tensor, ATP_R: torch.Tensor) -> torch.Tensor:
-        if self.rank_encoding == "scale_encoding":
-            encoded_ATP_R = self.compute_encoded_ATP_R(normalized_ATP=normalized_ATP, ATP_R=ATP_R)
-        else:
-            encoded_ATP_R = normalized_ATP * self.one_hot_embedding(ATP_R)
-
-        encoded_normalized_ATP = normalized_ATP * self.param_for_normalized_ATP
-        return encoded_ATP_R + encoded_normalized_ATP
-
-
-# ---------------------------
-# Models (baseline-compatible)
-# ---------------------------
-
-class ATP_R_MLP(nn.Module):
-    """
-    Baseline-compatible MLP using only (normalized_ATP, ATP_R), flattened over sequence.
-
-    forward(sorted_TDS_normalized, normalized_ATP, ATP_R) -> [B]
-    """
-    def __init__(self, args, actual_sequence_length: int):
-        super().__init__()
-        self.args = args
-        self.hidden_dim = args.hidden_dim
-        self.dropout = args.dropout
-        self.num_layers = args.num_layers
-        self.actual_sequence_length = actual_sequence_length
-
-        self.encoder = RankATPEncoder(args=args, hidden_dim=self.hidden_dim)
-
-        self.lin_layers = nn.ModuleList()
-        self.batch_norms = nn.ModuleList()
-
-        for i in range(self.num_layers):
-            in_dim = self.hidden_dim * self.actual_sequence_length if i == 0 else self.hidden_dim
-            out_dim = 1 if (i + 1) == self.num_layers else self.hidden_dim
-            self.lin_layers.append(nn.Linear(in_dim, out_dim))
-            if (i + 1) < self.num_layers:
-                self.batch_norms.append(nn.BatchNorm1d(out_dim))
-
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, sorted_TDS_normalized, normalized_ATP, ATP_R):
-        x = self.encoder(normalized_ATP=normalized_ATP, ATP_R=ATP_R)  # [B,N,D]
-        x = x.flatten(start_dim=1)  # [B, N*D]
-
-        for i, lin in enumerate(self.lin_layers):
-            x = lin(x)
-            if (i + 1) < self.num_layers:
-                x = self.batch_norms[i](x)
-                x = F.relu(x)
-                x = F.dropout(x, p=self.dropout, training=self.training)
-
-        return self.sigmoid(x).squeeze(-1)
-
-
-class ATP_R_Transf(nn.Module):
-    """
-    Baseline-compatible Transformer using only (normalized_ATP, ATP_R).
-
-    forward(sorted_TDS_normalized, normalized_ATP, ATP_R) -> [B]
-    """
-    def __init__(self, args, max_sequence_length: int, input_dim: int = 1):
-        super().__init__()
-        self.args = args
-        self.max_sequence_length = max_sequence_length
-        self.hidden_dim = args.hidden_dim
-        self.heads = args.heads
-        self.dropout = args.dropout
-        self.num_layers = args.num_layers
-        self.pool = _get_pool_type(args)
-
-        self.encoder = RankATPEncoder(args=args, hidden_dim=self.hidden_dim)
-
-        self.cls_token = nn.Parameter(torch.randn(1, 1, self.hidden_dim))
-        self.pos_embedding = nn.Embedding(self.max_sequence_length + 1, self.hidden_dim)
-
-        self.attention_layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=self.hidden_dim,
-                nhead=self.heads,
-                dropout=self.dropout,
-                dim_feedforward=self.hidden_dim * 4,
-                batch_first=True,
-                activation="gelu",
-                norm_first=True,
-            )
-            for _ in range(self.num_layers)
-        ])
-
-        self.mlp_head = nn.Linear(self.hidden_dim, 1)
-        self.sigmoid = nn.Sigmoid()
-
-    def _pool(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, N+1, D]
-        if self.pool == "cls":
-            return x[:, 0]
-        if self.pool == "mean":
-            return x.mean(dim=1)
-        if self.pool == "max":
-            return x.max(dim=1).values
-        if self.pool == "mean_cls":
-            return 0.5 * (x.mean(dim=1) + x[:, 0])
-        if self.pool == "mean_max":
-            return 0.5 * (x.mean(dim=1) + x.max(dim=1).values)
-        # mean_max_cls
-        return (x.mean(dim=1) + x.max(dim=1).values + x[:, 0]) / 3.0
-
-    def forward(self, sorted_TDS_normalized, normalized_ATP, ATP_R):
-        x = self.encoder(normalized_ATP=normalized_ATP, ATP_R=ATP_R).to(torch.float32)  # [B,N,D]
-        b, n, _ = x.shape
-
-        cls = repeat(self.cls_token, "1 1 d -> b 1 d", b=b)
-        x = torch.cat([cls, x], dim=1)  # [B,N+1,D]
-
-        pos_idx = torch.arange(n + 1, device=x.device).unsqueeze(0)
-        x = x + self.pos_embedding(pos_idx)
-
-        for layer in self.attention_layers:
-            x = layer(x)
-
-        x = self._pool(x)
-        x = self.mlp_head(x)
-        return self.sigmoid(x).squeeze(-1)
-
-
-class LOS_Net(nn.Module):
-    """
-    Baseline-compatible LOS-Net:
-    - Uses sorted_TDS_normalized projected to D/2
-    - Concatenates with ATP features projected to D/2
-    - Transformer over tokens (+ CLS)
-    """
-    def __init__(self, args, max_sequence_length: int, input_dim: int = 1):
-        super().__init__()
-        self.args = args
-        self.max_sequence_length = max_sequence_length
-        self.input_dim = input_dim
-        self.hidden_dim = args.hidden_dim
-        self.heads = args.heads
-        self.dropout = args.dropout
-        self.num_layers = args.num_layers
-        self.pool = _get_pool_type(args)
-
-        assert self.hidden_dim % 2 == 0, "hidden_dim must be even for LOS_Net (split into two halves)."
-
-        # ATP encoder produces D/2
-        self.atp_encoder = RankATPEncoder(args=args, hidden_dim=self.hidden_dim // 2)
-
-        # Project top-k probs/logits to D/2
-        self.input_proj = nn.Linear(input_dim, self.hidden_dim // 2)
-
-        # Tokens are concatenated to D
-        self.cls_token = nn.Parameter(torch.randn(1, 1, self.hidden_dim))
-        self.pos_embedding = nn.Embedding(self.max_sequence_length + 1, self.hidden_dim)
-
-        self.attention_layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=self.hidden_dim,
-                nhead=self.heads,
-                dropout=self.dropout,
-                dim_feedforward=self.hidden_dim * 4,
-                batch_first=True,
-                activation="gelu",
-                norm_first=True,
-            )
-            for _ in range(self.num_layers)
-        ])
-
-        self.mlp_head = nn.Linear(self.hidden_dim, 1)
-        self.sigmoid = nn.Sigmoid()
-
-    def _pool(self, x: torch.Tensor) -> torch.Tensor:
-        if self.pool == "cls":
-            return x[:, 0]
-        if self.pool == "mean":
-            return x.mean(dim=1)
-        if self.pool == "max":
-            return x.max(dim=1).values
-        if self.pool == "mean_cls":
-            return 0.5 * (x.mean(dim=1) + x[:, 0])
-        if self.pool == "mean_max":
-            return 0.5 * (x.mean(dim=1) + x.max(dim=1).values)
-        return (x.mean(dim=1) + x.max(dim=1).values + x[:, 0]) / 3.0  # mean_max_cls
-
-    def forward(self, sorted_TDS_normalized, normalized_ATP, ATP_R):
-        # sorted_TDS_normalized: [B,N,V] (V ~ 1000), float
-        tds = self.input_proj(sorted_TDS_normalized.to(torch.float32))  # [B,N,D/2]
-        atp = self.atp_encoder(normalized_ATP=normalized_ATP, ATP_R=ATP_R).to(torch.float32)  # [B,N,D/2]
-        x = torch.cat([tds, atp], dim=-1)  # [B,N,D]
-
-        b, n, _ = x.shape
-        cls = repeat(self.cls_token, "1 1 d -> b 1 d", b=b)
-        x = torch.cat([cls, x], dim=1)  # [B,N+1,D]
-
-        pos_idx = torch.arange(n + 1, device=x.device).unsqueeze(0)
-        x = x + self.pos_embedding(pos_idx)
-
-        for layer in self.attention_layers:
-            x = layer(x)
-
-        x = self._pool(x)
-        x = self.mlp_head(x)
-        return self.sigmoid(x).squeeze(-1)
-
-
-# ---------------------------
-# New: LOS_GRU (HALT-style)
-# ---------------------------
-
-class LOS_GRU(nn.Module):
-    def __init__(self, args, max_sequence_length: int, input_dim: int = 1000):
-        super().__init__()
-        self.args = args
-        self.max_sequence_length = max_sequence_length
-        self.input_dim = input_dim
-
-        self.hidden_dim = args.hidden_dim
-        self.dropout = args.dropout
-        self.num_layers = max(1, int(getattr(args, "num_layers", 1)))
-        self.bidirectional = bool(getattr(args, "bidirectional", True))
-        self.pool = _get_pool_type(args)
-
-        # Feature settings
-        self.use_entropy = True
-        self.use_margin = True
-        self.use_top_stats = True
-        self.use_atp = True
-
-        # HALT-style additions
-        self.raw_k = int(getattr(args, "raw_topk", 20))
-        self.topq = float(getattr(args, "topq", 0.2))
-        self.use_alt_entropy = bool(getattr(args, "alt_entropy", True))
-        self.use_binary_entropy_delta = bool(getattr(args, "bin_ent_delta", True))
-        self.use_raw_logp = bool(getattr(args, "raw_logp", True))
-
-        atp_dim = int(getattr(args, "atp_feature_dim", max(8, self.hidden_dim // 8)))
-        self.atp_encoder = RankATPEncoder(args=args, hidden_dim=atp_dim) if self.use_atp else None
-
-        base_feat_dim = 0
-        if self.use_entropy: base_feat_dim += 1
-        if self.use_margin: base_feat_dim += 2
-        if self.use_top_stats: base_feat_dim += 5
-        if self.use_alt_entropy: base_feat_dim += 1
-        if self.use_binary_entropy_delta: base_feat_dim += 1
-        if self.use_raw_logp: base_feat_dim += self.raw_k
-
-        total_feat_dim = base_feat_dim + (atp_dim if self.use_atp else 0)
-
-        gru_in_dim = int(getattr(args, "gru_input_dim", self.hidden_dim))
-        self.feat_proj = nn.Sequential(
-            nn.Linear(total_feat_dim, gru_in_dim),
+        # Sequence head: d_model -> d_model/2 -> 1
+        self.seq_head = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model // 2),
             nn.GELU(),
             nn.Dropout(self.dropout),
-        )
-
-        self.gru = nn.GRU(
-            input_size=gru_in_dim,
-            hidden_size=self.hidden_dim,
-            num_layers=self.num_layers,
-            batch_first=True,
-            dropout=self.dropout if self.num_layers > 1 else 0.0,
-            bidirectional=self.bidirectional,
-        )
-
-        out_dim = self.hidden_dim * (2 if self.bidirectional else 1)
-        self.head = nn.Sequential(
-            nn.LayerNorm(out_dim),
-            nn.Dropout(self.dropout),
-            nn.Linear(out_dim, 1),
+            nn.Linear(self.d_model // 2, 1),
         )
         self.sigmoid = nn.Sigmoid()
 
-    def _token_features(self, sorted_TDS_normalized: torch.Tensor) -> torch.Tensor:
-        x = sorted_TDS_normalized.to(torch.float32)  # [B,N,V]
-        eps = 1e-8
+        # Optional token head (kept OFF by default to avoid breaking training loops)
+        self.return_token_scores = _get_attr(args, "return_token_scores", False)
+        if self.return_token_scores:
+            self.token_head = nn.Linear(self.d_model, 1)
 
-        # Build (logp, p) robustly
-        # Case 1: probabilities
-        if x.min().item() >= 0.0 and x.max().item() <= 1.0 + 1e-3:
-            p = x.clamp_min(eps)
-            logp = p.log()
-        # Case 2: log-probabilities (typically <= 0)
-        elif x.max().item() <= 0.0:
-            logp = x
-            p = logp.exp().clamp_min(eps)
-        # Case 3: logits
-        else:
-            logp = torch.log_softmax(x, dim=-1)
-            p = logp.exp().clamp_min(eps)
+    def _rank_bucket_ids(self, ATP_R: torch.Tensor) -> torch.Tensor:
+        """
+        ATP_R: [B, N] (int-ish)
+        returns bucket_id: [B, N] in [0..num_buckets-1]
+        """
+        r = ATP_R.long().clamp_min(0)
+        # torch.bucketize returns index in [0..len(thresholds)]
+        # where index = number of thresholds < value (or <= depending on right)
+        # We want:
+        #   <=1 -> bucket 0 (value 1)
+        #   (1,2] -> bucket 1, ...
+        # We'll use right=True so values equal threshold go to that bucket.
+        bucket = torch.bucketize(r, self.rank_bucket_thresholds, right=True)
+        return bucket.clamp_max(self.rank_bucket_emb.num_embeddings - 1)
 
-        feats = []
+    def _apply_group_feature_mask(self, feats: torch.Tensor) -> torch.Tensor:
+        """
+        During training optionally zero out feature groups:
+        - top-k logp block
+        - entropy/margin/loggap/cdf/p_tail block
+        - ATP block (normalized_ATP, d_atp, d2_atp)
+        - rank block (rank, d_rank, rank_emb)
+        """
+        if (not self.training) or (not self.feature_masking) or (self.feature_mask_p <= 0):
+            return feats
 
-        # Entropy over the (top-k) normalized distribution we formed
-        if self.use_entropy:
-            feats.append(_safe_entropy(p, eps=eps))  # [B,N,1]
+        B, N, Fdim = feats.shape
+        device = feats.device
 
-        # Margin + log(p1)
-        p1 = p[..., 0:1]
-        p2 = p[..., 1:2] if p.size(-1) > 1 else torch.zeros_like(p1)
-        if self.use_margin:
-            feats.append(p1 - p2)
-            feats.append(_safe_log(p1, eps))  # log(p1) safe
+        # Indices based on concat order:
+        # [logp_top(k),
+        #  entropy(1), margin(1), log_gap(1), p_tail(1),
+        #  cdf2,cdf5,cdf10,cdf20 (4),
+        #  normalized_ATP(1), d_atp(1), d2_atp(1),
+        #  rank(1), d_rank(1),
+        #  d_entropy(1), d2_entropy(1),
+        #  rank_emb(rank_emb_dim)]
+        i = 0
+        sl_logp = slice(i, i + self.k); i += self.k
+        sl_shape = slice(i, i + (1 + 1 + 1 + 1 + 4)); i += (1 + 1 + 1 + 1 + 4)
+        sl_atp = slice(i, i + 3); i += 3
+        sl_rank = slice(i, i + 2); i += 2
+        sl_dent = slice(i, i + 2); i += 2
+        sl_rankemb = slice(i, i + self.rank_emb_dim); i += self.rank_emb_dim
 
-        # Summary stats (IMPORTANT: use the computed logp, don't overwrite it)
-        if self.use_top_stats:
-            mean_p = p.mean(dim=-1, keepdim=True)
-            std_p  = p.std(dim=-1, keepdim=True, unbiased=False)
-            max_p  = p.max(dim=-1, keepdim=True).values
+        # Groups to mask: logp, (shape stats incl dent? no), atp, rank(+emb)
+        # We'll treat d_entropy/d2_entropy as part of "shape" group.
+        groups = [
+            [sl_logp],
+            [sl_shape, sl_dent],
+            [sl_atp],
+            [sl_rank, sl_rankemb],
+        ]
 
-            mean_logp = logp.mean(dim=-1, keepdim=True)
-            std_logp  = logp.std(dim=-1, keepdim=True, unbiased=False)
+        # Sample group masks per-batch (same for all tokens)
+        # mask=0 means zero-out that group
+        for g in groups:
+            drop = (torch.rand(B, 1, 1, device=device) < self.feature_mask_p).float()
+            if drop.max() == 0:
+                continue
+            for sl in g:
+                feats[:, :, sl] = feats[:, :, sl] * (1.0 - drop)
 
-            feats.extend([mean_p, std_p, max_p, mean_logp, std_logp])
-
-        # Alt-entropy over alternatives excluding top-1
-        if self.use_alt_entropy:
-            p_alt = p[..., 1:]
-            z = p_alt.sum(dim=-1, keepdim=True).clamp_min(eps)
-            p_alt = p_alt / z
-            alt_ent = -(p_alt.clamp_min(eps) * p_alt.clamp_min(eps).log()).sum(dim=-1, keepdim=True)
-            feats.append(alt_ent)
-
-        # Binary decision entropy delta (top1 vs top2)
-        if self.use_binary_entropy_delta:
-            s = (p1 + p2).clamp_min(eps)
-            q1 = (p1 / s).clamp_min(eps)
-            q2 = (p2 / s).clamp_min(eps)
-            h_bin = -(q1 * q1.log() + q2 * q2.log())  # [B,N,1]
-            dh = torch.zeros_like(h_bin)
-            dh[:, 1:] = h_bin[:, 1:] - h_bin[:, :-1]
-            feats.append(dh)
-
-        # Raw top-K log-probs (HALT-style): USE logp directly
-        if self.use_raw_logp:
-            k = min(self.raw_k, p.size(-1))
-            feats.append(logp[..., :k])  # [B,N,k]
-
-        return torch.cat(feats, dim=-1)
-
-    def _topq_pool(self, h: torch.Tensor) -> torch.Tensor:
-        B, N, D = h.shape
-        q = self.topq if (0.0 < self.topq <= 1.0) else 0.2
-        k = max(1, int(math.ceil(q * N)))
-
-        scores = torch.norm(h, p=2, dim=-1)  # [B,N]
-        topk_idx = torch.topk(scores, k=k, dim=1, largest=True, sorted=False).indices  # [B,k]
-        idx = topk_idx.unsqueeze(-1).expand(-1, -1, D)  # [B,k,D]
-        gathered = torch.gather(h, dim=1, index=idx)    # [B,k,D]
-        return gathered.mean(dim=1)
-
-    def _pool_seq(self, h: torch.Tensor) -> torch.Tensor:
-        return self._topq_pool(h)
+        return feats
 
     def forward(self, sorted_TDS_normalized, normalized_ATP, ATP_R):
-        base = self._token_features(sorted_TDS_normalized)  # [B,N,F]
+        """
+        Inputs:
+            sorted_TDS_normalized: [B, N, V]  (descending over V)
+            normalized_ATP:        [B, N, 1]
+            ATP_R:                [B, N]
 
-        if self.use_atp:
-            atp = self.atp_encoder(normalized_ATP=normalized_ATP, ATP_R=ATP_R).to(torch.float32)
-            feats = torch.cat([base, atp], dim=-1)
+        Output:
+            seq_prob: [B]
+            (optionally token_scores: [B, N, 1] if args.return_token_scores=True)
+        """
+        B, N, V = sorted_TDS_normalized.shape
+        k = min(self.k, V)
+
+        # 2.1 Top-k probabilities
+        p_top = sorted_TDS_normalized[:, :, :k].to(torch.float32)          # [B,N,k]
+        p_tail = 1.0 - torch.sum(p_top, dim=-1, keepdim=True)              # [B,N,1]
+        p_tail = torch.clamp(p_tail, min=0.0)                              # robust
+        logp_top = torch.log(p_top + self.eps)                             # [B,N,k]
+
+        # 2.2 Distribution-shape stats
+        entropy_top = -torch.sum(p_top * logp_top, dim=-1, keepdim=True)   # [B,N,1]
+        if k >= 2:
+            margin = p_top[..., 0:1] - p_top[..., 1:2]                     # [B,N,1]
+            log_gap = logp_top[..., 0:1] - logp_top[..., 1:2]              # [B,N,1]
+            cdf2 = torch.sum(p_top[..., :2], dim=-1, keepdim=True)         # [B,N,1]
         else:
-            feats = base
+            margin = torch.zeros(B, N, 1, device=p_top.device, dtype=p_top.dtype)
+            log_gap = torch.zeros_like(margin)
+            cdf2 = torch.sum(p_top, dim=-1, keepdim=True)
 
-        x = self.feat_proj(feats)
-        h, _ = self.gru(x)
-        pooled = self._pool_seq(h)
-        logits = self.head(pooled)
-        return self.sigmoid(logits).squeeze(-1)
+        cdf5 = torch.sum(p_top[..., :min(5, k)], dim=-1, keepdim=True)
+        cdf10 = torch.sum(p_top[..., :min(10, k)], dim=-1, keepdim=True)
+        cdf20 = torch.sum(p_top, dim=-1, keepdim=True)                     # top-k mass
+
+        # 2.3 Rank features + bucket embedding
+        rank = ATP_R.unsqueeze(-1).to(torch.float32)                       # [B,N,1]
+        bucket_ids = self._rank_bucket_ids(ATP_R)                          # [B,N]
+        rank_emb = self.rank_bucket_emb(bucket_ids)                        # [B,N,E]
+
+        # 2.4 Temporal deltas
+        normalized_ATP = normalized_ATP.to(torch.float32)                  # [B,N,1]
+        d_atp = _delta_leftpad(normalized_ATP)
+        d2_atp = _delta_leftpad(d_atp)
+
+        d_entropy = _delta_leftpad(entropy_top)
+        d2_entropy = _delta_leftpad(d_entropy)
+
+        d_rank = _delta_leftpad(rank)
+
+        # 2.5 Final per-token feature vector
+        # IMPORTANT: if V < self.k, logp_top is [B,N,k] where k=min(self.k,V)
+        # To keep fixed feature dim, pad logp_top to self.k with zeros (rare but safe).
+        if k < self.k:
+            pad = torch.zeros(B, N, self.k - k, device=logp_top.device, dtype=logp_top.dtype)
+            logp_top_full = torch.cat([logp_top, pad], dim=-1)             # [B,N,self.k]
+            # also p_top used only for stats already computed; OK
+        else:
+            logp_top_full = logp_top                                       # [B,N,self.k]
+
+        feats = torch.cat([
+            logp_top_full,         # [B,N,k]
+            entropy_top,           # [B,N,1]
+            margin,                # [B,N,1]
+            log_gap,               # [B,N,1]
+            p_tail,                # [B,N,1]
+            cdf2, cdf5, cdf10, cdf20,  # [B,N,4]
+            normalized_ATP,        # [B,N,1]
+            d_atp, d2_atp,         # [B,N,2]
+            rank,                  # [B,N,1]
+            d_rank,                # [B,N,1]
+            d_entropy, d2_entropy, # [B,N,2]
+            rank_emb               # [B,N,E]
+        ], dim=-1)                 # [B,N,F]
+
+        feats = self.feature_ln(feats)
+        feats = self._apply_group_feature_mask(feats)
+        feats = self.feature_drop(feats)
+
+        # 3.1 Token projection
+        x = self.token_proj(feats)  # [B,N,D]
+
+        # 3.2 Local conv blocks
+        for blk in self.conv_blocks_list:
+            x = blk(x)              # [B,N,D]
+
+        # 3.3 Global transformer
+        h = self.transformer(x)     # [B,N,D]
+
+        # 4.1 Pooling
+        if self.pooling == "mean":
+            pooled = h.mean(dim=1)                  # [B,D]
+        else:
+            pooled = self.attn_pool(h)              # [B,D]
+
+        # 4.2 Sequence head
+        logits = self.seq_head(pooled)              # [B,1]
+        seq_prob = self.sigmoid(logits).squeeze(-1) # [B]
+
+        # 4.3 Optional token head (OFF by default)
+        if self.return_token_scores:
+            token_logits = self.token_head(h)       # [B,N,1]
+            token_prob = self.sigmoid(token_logits)
+            return seq_prob, token_prob
+
+        return seq_prob
+
+
+# -----------------------------
+# Update get_model mapping
+# -----------------------------
+def get_model(args, max_sequence_length, actual_sequence_length, input_dim, input_shape):
+    model_mapping = {
+        # LOS-based
+        'LOS-Net': LOS_Net,
+        'LOS++': LOS_PP_MultiScaleDeltaTransformer,   # <-- add this
+        'ATP_R_MLP': ATP_R_MLP,
+        'ATP_R_Transf': ATP_R_Transf,
+    }
+
+    if args.probe_model in {'LOS-Net', 'LOS++', 'ATP_R_Transf'}:
+        return model_mapping[args.probe_model](args=args, max_sequence_length=max_sequence_length, input_dim=input_dim)
+    elif args.probe_model in {'ATP_R_MLP'}:
+        return model_mapping[args.probe_model](args=args, actual_sequence_length=actual_sequence_length)
+    else:
+        raise ValueError(f"Unknown model: {args.probe_model}")
+
+
+"""
+# -----------------------------
+# Minimal shape test (optional)
+# -----------------------------
+if __name__ == "__main__":
+    class DummyArgs:
+        probe_model = "LOS++"
+        hidden_dim = 128
+        heads = 4
+        dropout = 0.1
+        num_layers = 2
+        pool = "mean"   # ignored unless pooling is None; sets pooling to mean
+        # Candidate params (optional overrides):
+        k = 20
+        rank_emb_dim = 16
+        conv_blocks = 3
+        transformer_layers = 2
+        pooling = "attn"
+        feature_masking = False
+
+    args = DummyArgs()
+    B, N, V = 2, 128, 32000
+    sorted_TDS_normalized = torch.rand(B, N, V)
+    sorted_TDS_normalized = torch.sort(sorted_TDS_normalized, dim=-1, descending=True).values
+    sorted_TDS_normalized = sorted_TDS_normalized / sorted_TDS_normalized.sum(dim=-1, keepdim=True)
+    normalized_ATP = torch.rand(B, N, 1)
+    ATP_R = torch.randint(low=1, high=2000, size=(B, N))
+
+    model = LOS_PP_MultiScaleDeltaTransformer(args=args, max_sequence_length=N, input_dim=1)
+    y = model(sorted_TDS_normalized, normalized_ATP, ATP_R)
+    print(y.shape)  # torch.Size([B])
+"""
