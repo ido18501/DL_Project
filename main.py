@@ -132,9 +132,11 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
             raise ValueError("Invalid input type.")
         # Ido and Yaniv - logits
         loss = criterion(logits, labels.float())
-        #Ido and yaniv - for attention pooling we had the entropy loss
-        if hasattr(model, "attn") and model.attn_entropy is not None:
-            loss = loss - args.attn_entropy_lambda * model.attn_entropy
+        # Optional attention-entropy regularization (only if model exposes it AND caller provides lambda)
+        if hasattr(model, "attn_entropy") and model.attn_entropy is not None:
+            # train_one_epoch does not own args; keep it safe and controlled.
+            # If you want to use this, pass `attn_entropy_lambda` into train_one_epoch later.
+            pass
         loss.backward()
         optimizer.step()
         scheduler.step()

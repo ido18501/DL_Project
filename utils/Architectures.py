@@ -130,15 +130,19 @@ class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
         # + d_entropy(1) + d2_entropy(1)
         # + rank_emb(rank_emb_dim)
         self.F = (
-            self.k + 1 + 1 + 1 + 1 +
-            4 +
-            1 + 1 + 1 +
-            1 + 1 +
-            1 + 1 +
-            self.rank_emb_dim
+                self.k +  # logp_top
+                1 + 1 + 1 + 1 +  # entropy, margin, log_gap, p_tail
+                4 +  # cdf2, cdf5, cdf10, cdf20
+                1 + 1 + 1 + 1 +  # log_raw_atp, normalized_ATP, d_atp, d2_atp
+                1 + 1 +  # rank, d_rank
+                1 + 1 +  # d_entropy, d2_entropy
+                self.rank_emb_dim  # rank embedding
         )
 
-        self.feature_ln = nn.LayerNorm(self.F)
+        # Group-wise normalization:
+        # We normalize only the high-dimensional logp_top block (shape information),
+        # and keep scalar calibration features on their natural scale.
+        self.logp_ln = nn.LayerNorm(self.k)
         self.feature_drop = nn.Dropout(self.dropout)
 
         # Optional stochastic feature masking (training only)
@@ -303,7 +307,10 @@ class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
         rank_emb = self.rank_bucket_emb(bucket_ids)                        # [B,N,E]
 
         # 2.4 Temporal deltas
-        normalized_ATP = normalized_ATP.to(torch.float32)                  # [B,N,1]
+        # Use normalized ATP for now; once dataset provides raw_ATP, we will pass it separately.
+        normalized_ATP = normalized_ATP.to(torch.float32)  # [B,N,1]
+        raw_ATP = normalized_ATP  # backward-compatible placeholder
+        log_raw_atp = torch.log(raw_ATP + self.eps)
         d_atp = _delta_leftpad(normalized_ATP)
         d2_atp = _delta_leftpad(d_atp)
 
@@ -329,7 +336,8 @@ class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
             log_gap,               # [B,N,1]
             p_tail,                # [B,N,1]
             cdf2, cdf5, cdf10, cdf20,  # [B,N,4]
-            normalized_ATP,        # [B,N,1]
+            log_raw_atp,  # [B,N,1] (calibration signal; will be raw later)
+            normalized_ATP,  # [B,N,1]
             d_atp, d2_atp,         # [B,N,2]
             rank,                  # [B,N,1]
             d_rank,                # [B,N,1]
@@ -337,7 +345,13 @@ class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
             rank_emb               # [B,N,E]
         ], dim=-1)                 # [B,N,F]
         feats = torch.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
-        feats = self.feature_ln(feats)
+        # --- Group-wise normalization (preserve calibration scale) ---
+        # feats is built as concat([logp_top_full, scalar_stats..., rank_emb...])
+        # We only LayerNorm the logp block (first self.k dims).
+        logp_block = feats[:, :, :self.k]
+        rest_block = feats[:, :, self.k:]
+        logp_block = self.logp_ln(logp_block)
+        feats = torch.cat([logp_block, rest_block], dim=-1)
         feats = self._apply_group_feature_mask(feats)
         feats = self.feature_drop(feats)
 
@@ -349,7 +363,15 @@ class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
             x = blk(x)              # [B,N,D]
 
         # 3.3 Global transformer
-        h = self.transformer(x)     # [B,N,D]
+        # 3.3 Global transformer
+        # Optional padding mask (True = keep token, False = pad)
+        src_key_padding_mask = None
+        if hasattr(self.args, "use_padding_mask") and self.args.use_padding_mask:
+            # Expect args to optionally pass attention_mask in the future.
+            # If not provided, we just don't mask.
+            pass
+
+        h = self.transformer(x, src_key_padding_mask=src_key_padding_mask)  # [B,N,D]
 
         # 4.1 Pooling
         if self.pooling == "mean":
