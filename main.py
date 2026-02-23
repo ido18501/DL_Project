@@ -356,12 +356,12 @@ def main():
     # Define the number of training steps
     num_training_steps = len(dataloader_train) * args.num_epochs  # Total training steps
     logger.info(f"Total number of training steps: {num_training_steps}, and warm-up steps: {int(0.1 * num_training_steps)}")
-    num_warmup_steps = int(0.1 * num_training_steps)  # 10% of steps for warm-up
+    num_warmup_steps = int(0.03 * num_training_steps)  # 10% of steps for warm-up
 
     # Create the scheduler
-    scheduler = get_scheduler(
-        "linear", optimizer=optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps
-    )
+    scheduler = get_scheduler("cosine", optimizer=optimizer,
+                              num_warmup_steps=num_warmup_steps,
+                              num_training_steps=num_training_steps)
 
     # Ido and yaniv - using logits and balancing labels
     criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device))
