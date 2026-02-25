@@ -362,7 +362,10 @@ def main():
 
     # Create the scheduler
     scheduler = get_scheduler(
-        "linear", optimizer=optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps
+        "constant_with_warmup",
+        optimizer=optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps,
     )
 
     # Ido and yaniv - using logits and balancing labels
