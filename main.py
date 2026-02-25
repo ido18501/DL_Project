@@ -315,7 +315,6 @@ def main():
 
     print(f"[TRAIN] pos={pos} neg={neg} pos_frac={pos / (pos + neg + 1e-9):.4f}")
     pos_weight = neg / max(pos, 1)
-    pos_weight = min(pos_weight, 10.0)
     print(f"[TRAIN] pos_weight = {pos_weight:.4f}")
 
 
