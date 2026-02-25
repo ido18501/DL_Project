@@ -117,7 +117,10 @@ class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
         # -----------------------
         # Core hparams
         # -----------------------
-        self.k = int(_get_attr(args, "k", 20))  # used for logp_top stats
+        self.k = int(_get_attr(args, "k", 20))
+        self.top_p = float(_get_attr(args, "top_p", 0.10))
+        self.conv_blocks = int(_get_attr(args, "conv_blocks", 2))
+        self.transformer_layers = int(_get_attr(args, "transformer_layers", _get_attr(args, "num_layers", 1)))
         self.d_model = int(_get_attr(args, "hidden_dim", 128))
         self.dropout = float(_get_attr(args, "dropout", 0.1))
 
