@@ -8,12 +8,12 @@ from utils.constants import MODEL_VOCAB_SIZES
 
 
 
-def delta_left_pad(x: torch.Tensor) -> torch.Tensor:
-    # compute first order derivative with left pad
+def delta_left_pad(x):
+    # here we compute first order derivative with left padding
     z = torch.zeros_like(x[:, :1])
     return torch.cat([z, x[:, 1:] - x[:, :-1]], dim=1)
 
-def top_p_mean(h: torch.Tensor, scores: torch.Tensor, p: float) -> torch.Tensor:
+def top_p_mean(h, scores, p):
     """
     h:      [B, N, D]
     scores: [B, N]  (higher means more suspicion)
@@ -21,31 +21,31 @@ def top_p_mean(h: torch.Tensor, scores: torch.Tensor, p: float) -> torch.Tensor:
     returns: [B, D]
     """
     B, N, D = h.shape
-    # min and max guard
+    # min and max guarding for safe operations
     p = float(max(min(p, 1.0), 1e-6))
     k = max(1, int(round(p * N)))
-    # top- k indices by score
-    top_v, top_i = torch.topk(scores, k=k, dim=1, largest=True, sorted=False)  # [B,k]
-    idx = top_i.unsqueeze(-1).expand(-1, -1, D)                                # [B,k,D]
-    z = torch.gather(h, dim=1, index=idx)                                  # [B,k,D]
-    return z.mean(dim=1)                                                   # [B,D]
+    # top-k indices by score
+    top_v, top_i = torch.topk(scores, k=k, dim=1, largest=True, sorted=False)
+    idx = top_i.unsqueeze(-1).expand(-1, -1, D)
+    z = torch.gather(h, dim=1, index=idx)
+    return z.mean(dim=1)
 
 
 # convolution block to apply before transformer
 class DepthwiseSeparableConv1DBlock(nn.Module):
-    def __init__(self, d_model, kernel_size, dropout):
+    def __init__(self, dim, kernel_size, dropout):
         super().__init__()
         self.dw = nn.Conv1d(
-            in_channels=d_model,
-            out_channels=d_model,
+            in_channels=dim,
+            out_channels=dim,
             kernel_size=kernel_size,
             padding=kernel_size // 2,
-            groups=d_model,
+            groups=dim,
             bias=False,
         )
         self.pw = nn.Conv1d(
-            in_channels=d_model,
-            out_channels=d_model,
+            in_channels=dim,
+            out_channels=dim,
             kernel_size=1,
             bias=True,
         )
@@ -53,12 +53,12 @@ class DepthwiseSeparableConv1DBlock(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x):
-        # x: [B, N, D]
+
         residual = x
-        y = x.transpose(1, 2)        # [B, D, N]
+        y = x.transpose(1, 2)
         y = self.dw(y)
         y = self.pw(y)
-        y = y.transpose(1, 2)        # [B, N, D]
+        y = y.transpose(1, 2)
         y = self.act(y)
         y = self.drop(y)
         return residual + y
@@ -66,21 +66,21 @@ class DepthwiseSeparableConv1DBlock(nn.Module):
 
 # attention pooling class
 class AttnPooling(nn.Module):
-    def __init__(self, d_model: int, dropout: float):
+    def __init__(self, dim, dropout):
         super().__init__()
-        h = max(8, d_model // 2)
+        h = max(8, dim // 2)
         self.mlp = nn.Sequential(
-            nn.Linear(d_model, h),
+            nn.Linear(dim, h),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(h, 1),
         )
 
     def forward(self, x):
-        # x: [B, N, D]
-        scores = self.mlp(x)                      # [B, N, 1]
-        w = torch.softmax(scores, dim=1)          # [B, N, 1]
-        return torch.sum(w * x, dim=1)            # [B, D]
+
+        scores = self.mlp(x)
+        w = torch.softmax(scores, dim=1)
+        return torch.sum(w * x, dim=1)
 
 
 # LOS++ class implementation
@@ -96,11 +96,11 @@ class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
         self.top_p = float(getattr(args, "top_p", 0.10))
         self.conv_blocks = int(getattr(args, "conv_blocks", 2))
         self.transformer_layers = int(getattr(args, "transformer_layers", getattr(args, "num_layers", 1)))
-        self.d_model = int(getattr(args, "hidden_dim", 128))
+        self.dim = int(getattr(args, "hidden_dim", 128))
         self.dropout = float(getattr(args, "dropout", 0.15))
         self.transformer_layers = int(getattr(args, "transformer_layers", getattr(args, "num_layers", 1)))
         self.heads = int(getattr(args, "heads", 4))
-        assert self.d_model % self.heads == 0, "hidden_dim must be divisible by number of heads"
+        assert self.dim % self.heads == 0, "hidden_dim must be divisible by number of heads"
         # prevent division by 0
         self.eps = 1e-9
         # pooling options
@@ -110,21 +110,21 @@ class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
         self.top_p = float(getattr(args, "top_p", 0.10))  # for top-p pooling
 
         if self.pooling not in {"mean", "attn", "cls", "meanmaxcls", "toppmean", "meanmaxclstop"}:
-            raise ValueError(f"Invalid pooling='{self.pooling}'. Choose one of {'mean', 'attn', 'cls', 'meanmaxcls', 'toppmean', 'meanmaxclstop'}")
+            raise ValueError(f"Invalid pooling")
 
         self.use_cls_token = self.pooling in {"cls", "meanmaxcls", "meanmaxclstop"}
-        self.attn_pool = AttnPooling(self.d_model, self.dropout)
+        self.attn_pool = AttnPooling(self.dim, self.dropout)
 
         # Rank encoding
         self.rank_encoding = getattr(args, "rank_encoding", "scale_encoding")
         if self.rank_encoding not in {"scale_encoding", "one_hot_encoding"}:
-            raise ValueError("rank_encoding must be 'scale_encoding' or 'one_hot_encoding'")
+            raise ValueError("Invalid rank encoding")
 
-        self.param_for_ATP_R = nn.Parameter(torch.randn(1, 1, self.d_model // 4))
+        self.param_for_ATP_R = nn.Parameter(torch.randn(1, 1, self.dim // 4))
         if self.rank_encoding == "one_hot_encoding":
-            self.one_hot_embedding = nn.Embedding(MODEL_VOCAB_SIZES[self.args.LLM], self.d_model // 4)
+            self.one_hot_embedding = nn.Embedding(MODEL_VOCAB_SIZES[self.args.LLM], self.dim // 4)
 
-        self.param_for_normalized_ATP = nn.Parameter(torch.randn(1, 1, self.d_model // 4))
+        self.param_for_normalized_ATP = nn.Parameter(torch.randn(1, 1, self.dim // 4))
         # The uneffective way of calculation below was meant to make each parameter's rule clear
         self.F = (
             self.k +          # log(p_top)
@@ -139,52 +139,52 @@ class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
 
         # spectrum branch
         self.spectrum_proj = nn.Sequential(
-            nn.Linear(input_dim, self.d_model // 2),
-            nn.LayerNorm(self.d_model // 2),
+            nn.Linear(input_dim, self.dim // 2),
+            nn.LayerNorm(self.dim // 2),
             nn.GELU(),
             nn.Dropout(self.dropout),
         )
 
         # Signature projection to D/2
         self.sig_proj = nn.Sequential(
-            nn.Linear(self.F + (self.d_model // 4) + (self.d_model // 4), self.d_model // 2),
-            nn.LayerNorm(self.d_model // 2),
+            nn.Linear(self.F + (self.dim // 4) + (self.dim // 4), self.dim // 2),
+            nn.LayerNorm(self.dim // 2),
             nn.GELU(),
             nn.Dropout(self.dropout),
         )
 
        # gated fusion
-        self.s2d = nn.Linear(self.d_model // 2, self.d_model, bias=False)
-        self.t2d = nn.Linear(self.d_model // 2, self.d_model, bias=False)
+        self.s2d = nn.Linear(self.dim // 2, self.dim, bias=False)
+        self.t2d = nn.Linear(self.dim // 2, self.dim, bias=False)
         self.gate_mlp = nn.Sequential(
-            nn.Linear(self.d_model, max(16, self.d_model // 4)),
+            nn.Linear(self.dim, max(16, self.dim // 4)),
             nn.GELU(),
             nn.Dropout(self.dropout),
-            nn.Linear(max(16, self.d_model // 4), 1),
+            nn.Linear(max(16, self.dim // 4), 1),
         )
-        self.fuse_ln = nn.LayerNorm(self.d_model)
+        self.fuse_ln = nn.LayerNorm(self.dim)
 
        # cls and positional embeddings
         if self.use_cls_token:
-            self.cls_token = nn.Parameter(torch.zeros(1, 1, self.d_model))
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, self.dim))
             nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
 
-        self.pos_embedding = nn.Embedding(self.max_sequence_length + 1, self.d_model)
+        self.pos_embedding = nn.Embedding(self.max_sequence_length + 1, self.dim)
 
         # local convolution vlocks- should be applied before transformer
         kernels = getattr(args, "conv_kernels", [3, 5, 7])
         if not isinstance(kernels, (list, tuple)) or len(kernels) == 0:
             kernels = [3, 5, 7]
         self.conv_blocks_list = nn.ModuleList([
-            DepthwiseSeparableConv1DBlock(self.d_model, int(kernels[i % len(kernels)]), self.dropout)
+            DepthwiseSeparableConv1DBlock(self.dim, int(kernels[i % len(kernels)]), self.dropout)
             for i in range(max(self.conv_blocks, 0))
         ])
 
        # transformer
         enc_layer = nn.TransformerEncoderLayer(
-            d_model=self.d_model,
+            d_model=self.dim,
             nhead=self.heads,
-            dim_feedforward=self.d_model * 2,
+            dim_feedforward=self.dim * 2,
             dropout=self.dropout,
             batch_first=True,
             activation="gelu",
@@ -192,24 +192,24 @@ class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=self.transformer_layers)
 
         # score for peak aware pooling - further testing should be done for this one
-        self.token_scorer = nn.Linear(self.d_model, 1)
+        self.token_scorer = nn.Linear(self.dim, 1)
 
         # Pool output dim - each method requires different dim
         if self.pooling in {"mean", "attn", "cls", "toppmean"}:
-            self.pool_out_dim = self.d_model
+            self.pool_out_dim = self.dim
         elif self.pooling == "meanmaxcls":
-            self.pool_out_dim = 3 * self.d_model
+            self.pool_out_dim = 3 * self.dim
         elif self.pooling == "meanmaxclstop":
-            self.pool_out_dim = 4 * self.d_model
+            self.pool_out_dim = 4 * self.dim
         else:
             raise RuntimeError("Unhandled pooling mode")
 
         # classification head
         self.seq_head = nn.Sequential(
-            nn.Linear(self.pool_out_dim, self.d_model),
+            nn.Linear(self.pool_out_dim, self.dim),
             nn.GELU(),
             nn.Dropout(self.dropout),
-            nn.Linear(self.d_model, 1),
+            nn.Linear(self.dim, 1),
         )
 
     def forward(self, sorted_TDS_normalized, normalized_ATP, ATP_R):
@@ -217,7 +217,7 @@ class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
         device = sorted_TDS_normalized.device
 
         # spectrum brunch
-        spectrum = self.spectrum_proj(sorted_TDS_normalized.to(torch.float32))  # [B,N,D/2]
+        spectrum = self.spectrum_proj(sorted_TDS_normalized.to(torch.float32))
 
        # sig feature claculated below
         k = min(self.k, V)
@@ -229,7 +229,7 @@ class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
         logp_top = torch.log(p_top + self.eps)
         logp_top = torch.nan_to_num(logp_top, nan=0.0, posinf=0.0, neginf=0.0)
 
-        entropy_top = -torch.sum(p_top * logp_top, dim=-1, keepdim=True)  # [B,N,1]
+        entropy_top = -torch.sum(p_top * logp_top, dim=-1, keepdim=True)
 
         if k >= 2:
             margin = p_top[..., 0:1] - p_top[..., 1:2]
@@ -280,7 +280,7 @@ class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
         # encodings
         if self.rank_encoding == "scale_encoding":
             vocab = float(MODEL_VOCAB_SIZES[self.args.LLM])
-            encoded_ATP_R = 2.0 * (0.5 - (ATP_R.to(torch.float32) / vocab))  # [B,N]
+            encoded_ATP_R = 2.0 * (0.5 - (ATP_R.to(torch.float32) / vocab))
             encoded_ATP_R = normalized_ATP * encoded_ATP_R.unsqueeze(-1) * self.param_for_ATP_R
         else:
             encoded_ATP_R = normalized_ATP * self.one_hot_embedding(ATP_R)
@@ -288,18 +288,18 @@ class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
         encoded_normalized_ATP = normalized_ATP * self.param_for_normalized_ATP
 
         sig_in = torch.cat([base_feats, encoded_ATP_R, encoded_normalized_ATP], dim=-1)
-        sig = self.sig_proj(sig_in)  # [B,N,D/2]
+        sig = self.sig_proj(sig_in)
 
        # gated fusion
-        sD = self.s2d(spectrum)   # [B,N,D]
-        tD = self.t2d(sig)        # [B,N,D]
-        g = torch.sigmoid(self.gate_mlp(self.fuse_ln(sD + tD)))  # [B,N,1]
-        x = self.fuse_ln(g * sD + (1.0 - g) * tD)                # [B,N,D]
+        sD = self.s2d(spectrum)
+        tD = self.t2d(sig)
+        g = torch.sigmoid(self.gate_mlp(self.fuse_ln(sD + tD)))
+        x = self.fuse_ln(g * sD + (1.0 - g) * tD)
 
        # clas and position embedding
         if self.use_cls_token:
-            cls = self.cls_token.expand(B, 1, self.d_model)
-            x = torch.cat([cls, x], dim=1)  # [B,N+1,D]
+            cls = self.cls_token.expand(B, 1, self.dim)
+            x = torch.cat([cls, x], dim=1)
             seq_len = x.size(1)
             pos_idx = torch.arange(seq_len, device=device).unsqueeze(0)
             x = x + self.pos_embedding(pos_idx)
@@ -312,15 +312,15 @@ class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
             x = blk(x)
 
         # transformer
-        h = self.transformer(x)  # [B,seq_len,D]
+        h = self.transformer(x)
 
         # pooling
         if self.use_cls_token:
-            cls = h[:, 0, :]          # [B,D]
-            token = h[:, 1:, :]             # [B,N,D]
+            cls = h[:, 0, :]
+            token = h[:, 1:, :]
         else:
             cls = None
-            token = h                        # [B,N,D]
+            token = h
 
         if self.pooling == "mean":
             pooled = token.mean(dim=1)
@@ -345,7 +345,7 @@ class LOS_PP_MultiScaleDeltaTransformer(nn.Module):
             raise RuntimeError(f"Pooling not supported")
 
        # head - returns logits!
-        logits = self.seq_head(pooled).squeeze(-1)  # [B]
+        logits = self.seq_head(pooled).squeeze(-1)
         return logits
 
 
