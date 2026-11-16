@@ -1,13 +1,13 @@
-# 📦 LOS-Net Official Repository
+# LOS-Net Deep Learning Project
 
-This repository contains the official code of the paper
-[**Beyond Next Token Probabilities: Learnable, Fast Detection of Hallucinations and Data Contamination on LLM Output Distributions**](https://arxiv.org/pdf/2503.14043) (*AAAI 2026*)
+Experiments on hallucination and data-contamination detection using LLM output signatures. This is a working copy of the LOS-Net codebase used for experimentation.
+
+The original method and implementation accompany [**Beyond Next Token Probabilities: Learnable, Fast Detection of Hallucinations and Data Contamination on LLM Output Distributions**](https://arxiv.org/pdf/2503.14043). The original authors are credited in the citation below.
+
+## Method overview
 
 
-# Overview
-
-
-We explore predicting problematic behaviors of LLMs, such as Hallucination Detection (HD) and Data Contamination (DC) detection, by learning from LLM Output Signatures (LOS), which are defined as the pair of TDS and ATP (see illustration below). We develop LOS-Net, a learnable gray-box model trained on LOS to predict these problematic behaviors.
+The original work studies problematic behaviors of LLMs, such as Hallucination Detection (HD) and Data Contamination (DC) detection, by learning from LLM Output Signatures (LOS), which are defined as the pair of TDS and ATP (see illustration below). LOS-Net is a learnable gray-box model trained on these signatures to predict problematic behaviors.
 
 
 <p align="center">
@@ -17,7 +17,7 @@ We explore predicting problematic behaviors of LLMs, such as Hallucination Detec
 
 
 
-⭐ If you find our implementation and paper helpful, please consider citing our work ⭐ :
+If you use the original method or code, cite the original authors:
 
 ```bibtex
 @article{bar2025learning,
@@ -28,17 +28,17 @@ We explore predicting problematic behaviors of LLMs, such as Hallucination Detec
 }
 ```
 
-Below we present the instructions to reproduce all the experiments we conducted in the paper.
+The instructions below are adapted from the original project and describe its experimental workflows.
 
 ## Table of Contents
 
 - [Installation](#installation)
-- [Handeling Datasets](#handeling-datasets)
+- [Handling Datasets](#handling-datasets)
     - [Generating Raw Datasets (DC)](#generating-raw-datasets-dc)
     - [Generating Raw Datasets (HD)](#generating-raw-datasets-hd)
   - [Preprocess Raw Datasets](#preprocess-raw-datasets)
 - [Reproducibility](#reproducibility)
-  - [Standard Experiments](#standard-experiemnts)
+  - [Standard Experiments](#standard-experiments)
   - [Transferability Experiments](#transferability-experiments)
     - [Zero-Shot Generalization on BookMIA](#zero-shot-generalization-on-bookmia)
     - [Generalization Across Datasets on Hallucinations Datasets](#generalization-across-datasets-on-hallucinations-datasets)
@@ -49,14 +49,14 @@ Below we present the instructions to reproduce all the experiments we conducted 
 
 First create a conda environment
 ```
-conda env create -f los_net_env.yml
+conda env create -f Los_net_env.yaml
 ```
 and activate it
 ```
 conda activate los_net_env
 ```
 
-# Handeling Datasets
+# Handling Datasets
 ### Generating Raw Datasets (DC)
 
 #### Available Datasets & Supported Models
@@ -205,7 +205,7 @@ To preprocess all raw datasets for all models:
 
 
 # Reproducibility
-## Standard Experiemnts 
+## Standard Experiments 
 To reproduce the experiments from the paper, run the commands below:
 
 - DC:
